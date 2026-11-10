@@ -162,6 +162,7 @@ def mask_keys(card, face):
     frame = str(card.get("frame", ""))
     set = (card.get("set") or "").lower()
     tl = (face.get("type_line") or card.get("type_line") or "").lower()
+    effects = {str(e).lower() for e in (card.get("frame_effects") or []) + (face.get("frame_effects") or [])}
     if set == "leb":
         base = "leb"
     elif layout == "planeswalker" or "planeswalker" in tl:
@@ -177,7 +178,7 @@ def mask_keys(card, face):
     else:
         base = FRAME_ALIASES.get(frame, frame)
     keys = []
-    if "legendary" in tl:
+    if "legendary" in effects:
         keys.append(f"{base}_legendary")
     keys += [f"{base}_default", "default"]
     return keys
