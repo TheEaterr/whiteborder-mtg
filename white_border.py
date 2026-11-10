@@ -122,8 +122,11 @@ def mask_keys(card, face):
     """Mask lookup keys for a card face: legendary variant first, then defaults."""
     layout = (card.get("layout") or "").lower()
     frame = str(card.get("frame", ""))
+    set = (card.get("set") or "").lower()
     tl = (face.get("type_line") or card.get("type_line") or "").lower()
-    if layout == "planeswalker" or "planeswalker" in tl:
+    if set == "leb":
+        base = "leb"
+    elif layout == "planeswalker" or "planeswalker" in tl:
         base = "planeswalker"
     elif layout == "saga" or "saga" in tl:
         base = "saga"
