@@ -3,7 +3,8 @@
 
 Given a Scryfall card link (https://scryfall.com/card/<set>/<collector-number>/<slug>),
 downloads the card's png image and applies a border mask, painting the mask
-region white.
+region white. The link only identifies the card: its oldest printing is used,
+except that Alpha (lea) is skipped in favor of Beta (leb).
 
 Masks live in ./masks (override with --masks-dir) and are generated from
 CardConjurer frame-pack assets by make_masks.py - CardConjurer isolates the
@@ -17,12 +18,16 @@ and to legendary cards (crown excluded). Naming:
     masks/default.png           last-resort fallback
 
 <key> comes from the card's layout (planeswalker/saga/modal/battle) or its
-Scryfall frame year (1993, 1997, 2003, 2015, 2019->2015, future). A mask may be
+Scryfall frame year (1993, 1997, 2003, 2015, 2019->2015, future); the
+_legendary variant is used when the printing's frame_effects contain
+"legendary" (old frames render no crown, so the type line alone is not a
+reliable signal). A mask may be
 any size; it is resized (bilinear) to the card image and its grayscale values
 are used directly as per-pixel blend weights for the white paint, multiplied
 by the card's alpha mask so the rounded corners stay clean. Blur the masks
 with blur_mask.py first and the border edge comes out soft instead of hard.
-Every face of a double-faced card is processed.
+Every face of a double-faced card is processed (adventures count as
+single-faced: their two card_faces share the card's one image).
 
 Usage:
     white_border.py <scryfall-url> [-o OUTPUT] [--masks-dir DIR] [--face N]
@@ -124,6 +129,9 @@ def oldest_printing(card):
 
 
 def card_faces(card):
+    if (card.get("layout") or "").lower() == "adventure":
+        # adventures list two card_faces but share the card's single image
+        return [card]
     return card.get("card_faces") or [card]
 
 
@@ -165,6 +173,8 @@ def mask_keys(card, face):
     effects = {str(e).lower() for e in (card.get("frame_effects") or []) + (face.get("frame_effects") or [])}
     if set == "leb":
         base = "leb"
+    elif "spree" in effects:
+        base = "spree"
     elif layout == "planeswalker" or "planeswalker" in tl:
         base = "planeswalker"
     elif layout == "saga" or "saga" in tl:
@@ -173,7 +183,7 @@ def mask_keys(card, face):
         # check before modal_dfc/transform: MOM-style battles report
         # layout "transform" but have "Battle" in their type line
         base = "battle"
-    elif layout in ("modal_dfc", "transform", "meld"):
+    elif layout == "modal_dfc":
         base = "modal"
     else:
         base = FRAME_ALIASES.get(frame, frame)
@@ -200,7 +210,6 @@ def load_border_mask(keys, w, h, masks_dir):
 # ------------------------------------------------------------------ pipeline
 
 def process_face(face, card, masks_dir, out_path):
-    # adventure cards keep image_uris on the card object, not on card_faces[0]
     uris = face.get("image_uris") or card.get("image_uris") or {}
     png_url = uris.get("png")
     if not png_url:

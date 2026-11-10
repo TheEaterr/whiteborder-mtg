@@ -32,6 +32,8 @@ def blur_image(src, dst, radius):
     img = Image.open(src)
     if img.mode == "P":  # palette images don't filter well; keep transparency
         img = img.convert("RGBA")
+    elif img.mode == "1":  # 1-bit bilevel: GaussianBlur needs a grayscale image
+        img = img.convert("L")
     blurred = img.filter(ImageFilter.GaussianBlur(radius))
     blurred.save(dst)
     return img.size, img.mode
