@@ -82,7 +82,45 @@ def get_card(link):
     data = json.loads(http_get(scryfall_api_url(link)))
     if data.get("object") == "error":
         raise SystemExit(f"error: Scryfall said: {data.get('details', data)}")
-    return data
+    card = oldest_printing(data)
+    if (card.get("set"), str(card.get("collector_number"))) != \
+            (data.get("set"), str(data.get("collector_number"))):
+        print(f"oldest printing: {card.get('set_name')} #{card.get('collector_number')} "
+              f"({card.get('set')}, {card.get('released_at')})")
+    return card
+
+
+def search_all(uri):
+    """Follow a Scryfall search endpoint's pagination and return every result."""
+    results = []
+    while uri:
+        data = json.loads(http_get(uri))
+        if data.get("object") == "error":
+            raise SystemExit(f"error: Scryfall said: {data.get('details', data)}")
+        results.extend(data.get("data", []))
+        uri = data.get("next_page") if data.get("has_more") else None
+    return results
+
+
+def oldest_printing(card):
+    """Oldest printing of the card; Alpha (lea) is skipped in favor of Beta (leb)."""
+    uri = card.get("prints_search_uri")
+    if not uri and card.get("oracle_id"):
+        uri = ("https://api.scryfall.com/cards/search?q=oracle_id:"
+               + urllib.parse.quote(card["oracle_id"]) + "&unique=prints")
+    if not uri:
+        return card
+    prints = [c for c in search_all(uri) if c.get("oracle_id") == card.get("oracle_id")]
+    if not prints:
+        return card
+    prints.sort(key=lambda c: (c.get("released_at") or "", (c.get("set") or "").lower(),
+                               str(c.get("collector_number") or "")))
+    oldest = prints[0]
+    if (oldest.get("set") or "").lower() == "lea":
+        leb = next((c for c in prints if (c.get("set") or "").lower() == "leb"), None)
+        if leb is not None:
+            oldest = leb
+    return oldest
 
 
 def card_faces(card):
