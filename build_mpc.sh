@@ -6,7 +6,7 @@
 #     4 Black Lotus
 #     1 Bala Ged Recovery // Bala Ged Sanctuary
 #
-# Each card is looked up on Scryfall by name and run through white_border.py
+# Each card is looked up on Scryfall by name and run through negate_border.py
 # (via `nix run`, or local python3 with pillow+numpy). Output structure:
 #     <outdir>/
 #       cards/
@@ -44,11 +44,11 @@ else
 fi
 
 if python3 -c "import PIL" >/dev/null 2>&1; then
-    run() { python3 "$SCRIPT_DIR/white_border.py" "$@"; }
+    run() { python3 "$SCRIPT_DIR/negate_border.py" "$@"; }
 elif command -v nix >/dev/null 2>&1; then
     run() { nix run "$SCRIPT_DIR#default" -- "$@"; }
 else
-    echo "error: need python3+pillow or nix to run white_border.py" >&2
+    echo "error: need python3+pillow or nix to run negate_border.py" >&2
     exit 1
 fi
 
@@ -98,8 +98,8 @@ while IFS= read -r line || [ -n "$line" ]; do
 
     echo "=== [$num] $cname  ($setnum)"
     front="$CARDS/$nn - $sname [c-$num].png"
-    # --mpc: white-border at the MPC Autofill format (63x88 mm @ 800 DPI = 1984x2772 px)
-    run "https://api.scryfall.com/cards/$setnum" -o "$front" --masks-dir "$SCRIPT_DIR/masks" --mpc 2>&1 | tail -n 3 || fail=1
+    # --mpc: negate-border at the MPC Autofill format (63x88 mm @ 800 DPI = 1984x2772 px)
+    run "https://api.scryfall.com/cards/$setnum" -o "$front" --mpc 2>&1 | tail -n 3 || fail=1
 
     # double-faced card: turn the _face1/_face2 outputs into a [b-...] front/back pair
     f1="${front%.png}_face1.png"

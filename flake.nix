@@ -1,5 +1,5 @@
 {
-  description = "magic_frame - recolor the border of any Scryfall MTG card to white";
+  description = "magic_frame - negate the black border of any Scryfall MTG card";
 
   # Pinned to the same nixpkgs revision as this machine's NixOS config,
   # so the flake resolves against the local store.
@@ -24,8 +24,8 @@
             ps.numpy
           ]);
         in
-        pkgs.writeShellScriptBin "white-border" ''
-          exec ${pythonEnv}/bin/python3 ${./white_border.py} "$@"
+        pkgs.writeShellScriptBin "negate-border" ''
+          exec ${pythonEnv}/bin/python3 ${./negate_border.py} "$@"
         '';
     in
     {
@@ -36,7 +36,7 @@
       apps = forAllSystems (pkgs: {
         default = {
           type = "app";
-          program = "${mkPackage pkgs}/bin/white-border";
+          program = "${mkPackage pkgs}/bin/negate-border";
         };
       });
 
@@ -47,15 +47,13 @@
             (pkgs.python3.withPackages (ps: [
               ps.pillow
               ps.numpy
-              ps.cairosvg # make_masks.py rasterizes CardConjurer border.svg assets
             ]))
           ];
           shellHook = ''
             echo "magic_frame dev shell"
-            echo "  run the tool:      white-border <scryfall-url>"
+            echo "  run the tool:      negate-border <scryfall-url|image-file|dir>"
             echo "  or via nix:        nix run .#default -- <scryfall-url>"
-            echo "  (re)build masks:   python3 make_masks.py"
-            echo "  soften mask edges: python3 blur_mask.py masks -o masks-blurred"
+            echo "  reference masks are cached in ref_masks/ (override with --ref-dir)"
           '';
         };
       });
