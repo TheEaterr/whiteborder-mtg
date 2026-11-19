@@ -16,13 +16,16 @@ The border color of the processed card is sampled from its bottom edge and
 reported, but the border region itself comes from the reference mask.
 
 Inside the border the card is inverted (negative filter, 255 - pixel); the
-last (innermost) line of pixels of the border region carries mask value 0.5
-and is applied as transparent (alpha 0) instead of a flat gray line, while
-the outermost pixel line of the card is negated like the rest of the border.
+border region is grown by one pixel into the card interior and the innermost
+line of that grown region carries mask value 0.5, applied lightened
+(max(original, 255 - original) per channel) so no dark line can appear
+between the white border and the card, and that line is not part of the
+border itself. The outermost pixel line of the card is negated like the rest
+of the border.
 Enclosed pockets inside the border (the copyright / rarity / set info text
 in the black bottom band) are part of the mask and are negated along with
-the border. Apart from that inner line, the alpha channel is never touched,
-so rounded corners stay clean.
+the border. The alpha channel is never touched, so rounded corners stay
+clean.
 
 Local image files / directories are processed the same way, except that the
 border is detected on the image itself (no Scryfall reference is used).
@@ -32,7 +35,7 @@ Usage:
     negate_border.py IMAGE [-o OUT] [flags]
     negate_border.py DIR [-o OUTDIR] [flags]
 
-Detection flags: --threshold / --pad / --max-hole.
+Detection flags: --threshold / --max-hole.
 Output flags: --ref-dir (mask cache), --scale F, --mpc (MPC Autofill format:
 63x88 mm card at 800 DPI = 1984x2772 px).
 
@@ -62,8 +65,10 @@ USER_AGENT = "magic-frame/1.0 (negate-border card tool)"
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
-# mask value of the innermost line of pixels of the border region; applied
-# as transparent (alpha 0) instead of a flat gray line
+# mask value of the innermost line of pixels of the border region (one pixel
+# inside the border); applied lightened - max(original, 255 - original) per
+# channel - so it can never be darker than the negated border and no dark
+# line shows between the white border and the card
 INNER_EDGE_MARK = 0.5
 
 # mask cache next to the script; when the script itself lives in a read-only
@@ -312,7 +317,7 @@ def detect_border_color(sub, card):
     return np.median(px, axis=0)
 
 
-def detect_region(img, threshold=32, pad=1, max_hole=20000):
+def detect_region(img, threshold=32, max_hole=20000):
     """Detect the border region of a card image.
 
     Returns (region mask or None, border color hex)."""
@@ -344,8 +349,6 @@ def detect_region(img, threshold=32, pad=1, max_hole=20000):
     region = flood_from_edges(black, black & edge)
     # enclosed pockets (copyright / rarity / set info text in the bottom band)
     region |= fill_enclosed_pockets(region, card, max_hole)
-    for _ in range(max(0, pad)):
-        region = dilate8(region) & card
 
     region_full = np.zeros(card_full.shape, bool)
     region_full[y0:y1, x0:x1] = region
@@ -353,9 +356,11 @@ def detect_region(img, threshold=32, pad=1, max_hole=20000):
 
 
 def mask_from_region(region, card):
-    """Grayscale float mask from a binary border region: 1 inside the border,
-    INNER_EDGE_MARK on the innermost line of pixels (applied as transparent),
-    0 outside."""
+    """Grayscale float mask from a binary border region: the region is grown by
+    one pixel into the card interior first, so the lightened line is not part
+    of the border itself. 1 inside the grown region, INNER_EDGE_MARK on its
+    innermost line of pixels (applied lightened), 0 outside."""
+    region = dilate8(region) & card
     inner = region & dilate8(card & ~region)
     m = np.zeros(region.shape, np.float32)
     m[region] = 1.0
@@ -445,7 +450,7 @@ def reference_mask(key, card, face, ref_dir, args):
     png = (ref.get("image_uris") or {}).get("png")
     img = Image.open(io.BytesIO(http_get(png)))
     region, border_hex = detect_region(
-        img, threshold=args.threshold, pad=args.pad, max_hole=args.max_hole)
+        img, threshold=args.threshold, max_hole=args.max_hole)
     if region is None or not region.any():
         return None, None
     mask = mask_from_region(region, card_mask(img))
@@ -463,7 +468,9 @@ def apply_mask(img, mask, scale=1.0, mpc=False):
 
     mask 1 (resized to the card, NEAREST so the 0 / 0.5 / 1 values survive) ->
     pixel inverted (255 - pixel); the innermost border line (0 < mask < 1) ->
-    transparent (alpha 0); 0 -> untouched. Returns (image, weight, frac, inner)."""
+    lightened to max(original, 255 - original) per channel (opaque, so no
+    dark line can show between the negated border and the card); 0 ->
+    untouched. Returns (image, weight, frac, inner)."""
     arr = np.asarray(img.convert("RGBA")).copy()
     cmask = card_mask(img)
     h, w = cmask.shape
@@ -472,11 +479,14 @@ def apply_mask(img, mask, scale=1.0, mpc=False):
             Image.fromarray((mask * 255).round().astype(np.uint8), "L")
             .resize((w, h), Image.NEAREST), dtype=np.float32) / 255.0
     weight = (mask >= 1.0) & cmask          # full negate
-    inner = (mask > 0.0) & (mask < 1.0) & cmask  # innermost line -> transparent
+    inner = (mask > 0.0) & (mask < 1.0) & cmask  # innermost line -> blend
     a = weight[..., None].astype(np.float32)
     rgb = arr[..., :3].astype(np.float32)
     arr[..., :3] = np.round(rgb * (1 - a) + (255.0 - rgb) * a).astype(np.uint8)
-    arr[..., 3][inner] = 0
+    # innermost line: lightened (never darker than the negated border), so
+    # the white border blends into the card without a dark line - negating a
+    # light card-edge pixel would produce a black line on white cards
+    arr[..., :3][inner] = np.maximum(rgb[inner], 255.0 - rgb[inner]).astype(np.uint8)
     out = Image.fromarray(arr, "RGBA")
     if mpc:
         out = out.resize(MPC_SIZE, Image.LANCZOS)
@@ -494,7 +504,7 @@ def process_image(img, args, card=None, face=None):
     white reference for the card's characteristics; otherwise (or when no
     reference exists) it is detected on the image itself."""
     region, border_hex = detect_region(
-        img, threshold=args.threshold, pad=args.pad, max_hole=args.max_hole)
+        img, threshold=args.threshold, max_hole=args.max_hole)
     stats = {"found": False, "frac": 0.0, "border": border_hex, "mask": "none"}
 
     mask = None
@@ -521,7 +531,7 @@ def process_image(img, args, card=None, face=None):
 def report(tag, dst, out, stats):
     print(f"{tag} -> {dst}  (border color {stats.get('border')}, mask: {stats.get('mask')}, "
           f"{stats['frac']:.1f}% of card negated, {stats.get('inner', 0)} px inner line "
-          f"transparent, {out.width}x{out.height})")
+          f"lightened, {out.width}x{out.height})")
 
 
 def process_file(src, dst, args):
@@ -574,9 +584,6 @@ def main():
                    help="max per-channel distance from the detected border color for a "
                         "pixel to count as border when detecting it on a card "
                         "(default: 32)")
-    p.add_argument("--pad", type=int, default=1,
-                   help="pixels the detected border region is dilated by before negating, "
-                        "to swallow the anti-aliased edge (default: 1)")
     p.add_argument("--max-hole", type=int, default=20000,
                    help="largest enclosed pocket inside the border that still becomes part "
                         "of the mask - covers the copyright / rarity / set info text in "
