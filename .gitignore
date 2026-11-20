@@ -1,4 +1,5 @@
 __pycache__
 .direnv/*
 ref_masks/
+/test_cards_negated/
 /result

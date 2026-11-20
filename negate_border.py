@@ -44,7 +44,9 @@ Output flags: --ref-dir (mask cache), --scale F, --mpc (MPC Autofill format:
 Default outputs: <name>_negated.<ext> next to the input file, <dir>-negated/
 for a directory, <card>_negated.png for a URL (or <card>_faceN_negated.png per
 face for transform / modal_dfc cards - second faces are only processed for
-those layouts).
+those layouts). Each face of a two-faced card gets the reference mask of its
+own characteristics (e.g. a planeswalker back side gets the planeswalker
+mask); a back side never carries a holostamp or the DFC mark.
 
 Requires pillow + numpy (provided by the flake devShell:
 nix develop --command python3 negate_border.py IMAGE)
@@ -139,26 +141,36 @@ def stamp_of(card, face=None):
     return str(ss).lower() if ss else None
 
 
+# stamps sharing the regular oval stamp's artwork and position are aliased
+# to it
+STAMP_ALIASES = {"acorn": "oval"}
+
+
 def stamp_key(stamp):
     """Stamp component of a reference key: None (no stamp), "stamp" for the
-    regular oval stamp, "stamp_<value>" for any other stamp (e.g.
-    "stamp_triangle" for the Universes Beyond stamp). Stamped and
-    non-stamped cards - and UB vs regular stamps - get different masks."""
+    regular oval stamp (and its aliases, e.g. "acorn"), "stamp_<value>" for
+    any other stamp (e.g. "stamp_triangle" for the Universes Beyond stamp).
+    Stamped and non-stamped cards - and UB vs regular stamps - get different
+    masks."""
     if not stamp:
         return None
-    return "stamp" if stamp == "oval" else f"stamp_{stamp}"
+    s = str(stamp).lower()
+    s = STAMP_ALIASES.get(s, s)
+    return "stamp" if s == "oval" else f"stamp_{s}"
 
 
 # layouts with their own frame (the base of the reference key); class and case
-# share the saga frame
+# share the saga frame. Rooms and battles are not detected from the layout
+# but from the type line: rooms have a split layout, battles a transform one
+# (layout:battle is not a Scryfall search qualifier)
 LAYOUT_BASES = {"saga": "saga", "class": "saga", "case": "saga",
-                "battle": "battle", "modal_dfc": "modal", "leveler": "leveler"}
+                "modal_dfc": "modal", "leveler": "leveler"}
 # split cards are refined by subtype, detected from the keywords
 SPLIT_KEYWORDS = (("fuse", "fuse"), ("aftermath", "aftermath"))
 # layouts with the same border as a normal card of the same frame era;
 # transform/meld marks come from the frame effects (dfc bucket)
 LAYOUT_SAME_AS_NORMAL = {"flip", "adventure", "prepare", "mutate", "prototype",
-                         "host", "transform", "meld"}
+                         "host", "meld"}
 # layouts whose card physically has a second face with its own image - every
 # face is processed; every other layout shares the single front image
 MULTI_FACE_LAYOUTS = {"transform", "modal_dfc"}
@@ -296,7 +308,10 @@ def blandness(c):
 
 
 def oldest_printing(card):
-    """Oldest printing of the card; Alpha (lea) is skipped in favor of Beta (leb).
+    """Oldest printing of the card; Alpha (lea) is never chosen - when the
+    oldest printing would be Alpha, the next-oldest set is taken instead
+    (Beta, leb, for Alpha cards) - and a foil-only printing is never chosen
+    when a non-foil one exists.
 
     When that oldest set has several printings of the card, the blandest one
     (plain border, no promo/full-art/showcase/etc.) wins over the collector
@@ -310,14 +325,15 @@ def oldest_printing(card):
     prints = [c for c in search_all(uri) if c.get("oracle_id") == card.get("oracle_id")]
     if not prints:
         return card
+    nonfoil = [c for c in prints if not (c.get("foil") and not c.get("nonfoil"))]
+    if nonfoil:
+        prints = nonfoil
+    non_lea = [c for c in prints if (c.get("set") or "").lower() != "lea"]
+    if non_lea:
+        prints = non_lea
     prints.sort(key=lambda c: (c.get("released_at") or "", (c.get("set") or "").lower(),
                                blandness(c), str(c.get("collector_number") or "")))
-    oldest = prints[0]
-    if (oldest.get("set") or "").lower() == "lea":
-        leb = next((c for c in prints if (c.get("set") or "").lower() == "leb"), None)
-        if leb is not None:
-            oldest = leb
-    return oldest
+    return prints[0]
 
 
 def card_faces(card):
@@ -497,24 +513,42 @@ def ref_key(card, face):
     border ring, not an exclusive choice - it always starts with the frame
     era (the "date"):
         <era>_<base>[_<variant>][+<extras>]
-    base: leb, spree, planeswalker, split_<fuse|aftermath|regular>, saga (also
-    class/case), battle, modal (modal_dfc), leveler, meld (the back side of a
+    base: leb, spree, planeswalker, room (Enchantment — Room, split layout),
+    battle (Battle — ..., detected from the type line since layout:battle is
+    not a Scryfall qualifier), split_<fuse|aftermath|regular>, saga (also
+    class/case), modal (modal_dfc), leveler, meld (the back side of a
     meld card - the front carries the meld mark and is a normal card), or
     "default" for normal and the same-as-normal layouts - e.g. leveler exists
     both as 2003_leveler and 2015_leveler;
     variant: legendary (crowned, plus creature/non-creature) when legendary;
+    for the default base also creature/other when not legendary - creature
+    and non-creature default frames differ (power/toughness box);
     extras: one per relevant frame-effect bucket (dfc, fandfc, unknown) plus
     the holostamp (stamp, or stamp_<value>, e.g. stamp_triangle for the
     Universes Beyond stamp).
-    Examples: 2015_default, 2015_default+stamp, 2015_default+dfc+stamp,
+    Each face of a two-faced card gets the characteristics of its own face:
+    the face's frame_effects are used when Scryfall provides them (otherwise
+    the card-level ones), and the type line is face-first - so e.g. the
+    planeswalker back side of a modal_dfc card gets the planeswalker base. A
+    back side (second face of a transform/modal_dfc card, or the back of a
+    meld card) never carries a holostamp and never the DFC mark.
+    Examples: 2015_default_creature+stamp, 2015_default_other+stamp,
+    2015_default_creature+dfc+stamp,
     2015_default_legendary_creature_crowned+stamp, 2003_leveler, 2015_saga.
     """
     layout = (card.get("layout") or "").lower()
     era = frame_era(card.get("frame", ""))
     card_set = (card.get("set") or "").lower()
     tl = (face.get("type_line") or card.get("type_line") or "").lower()
-    effects = {str(e).lower() for e in (card.get("frame_effects") or [])
-               + (face.get("frame_effects") or [])}
+    # per-face frame effects: when the face carries its own (non-None)
+    # frame_effects they are used alone, otherwise the card-level effects
+    # apply - so a card-level mark (e.g. "legendary") does not leak onto a
+    # back face that does not have it itself
+    face_effects = face.get("frame_effects") if face is not card else None
+    if face_effects is not None:
+        effects = {str(e).lower() for e in face_effects}
+    else:
+        effects = {str(e).lower() for e in (card.get("frame_effects") or [])}
     keywords = {str(k).lower() for k in (card.get("keywords") or [])
                 + (face.get("keywords") or [])}
     if card_set == "leb":
@@ -525,6 +559,14 @@ def ref_key(card, face):
         # planeswalker frames differ per era (2003 Lorwyn frame vs 2015+),
         # the era is carried by the key prefix
         base = "planeswalker"
+    elif "room" in tl:
+        # rooms (Enchantment — Room) have a split layout but a frame of their
+        # own - checked before the split branch
+        base = "room"
+    elif "battle" in tl:
+        # battles (Battle — Siege) are transform-layout cards; the card type
+        # identifies them since layout:battle is not a Scryfall qualifier
+        base = "battle"
     elif layout == "split":
         sub = next((s for kw, s in SPLIT_KEYWORDS if kw in keywords), "regular")
         base = f"split_{sub}"
@@ -537,6 +579,10 @@ def ref_key(card, face):
     else:
         # normal and LAYOUT_SAME_AS_NORMAL share the frame-era border
         base = "default"
+    # a back side never has a holostamp and never the DFC mark: the second
+    # face of a transform/modal_dfc card, or the back of a meld card
+    faces = card.get("card_faces") or []
+    is_back = base == "meld" or (bool(faces) and face is not faces[0])
     legendary = "legendary" in effects or "legendary" in tl
     # the legendary crown (frame effect "legendary") was introduced with
     # Dominaria (CROWN_DATE) and only exists on 2015/future-frame legendary
@@ -558,12 +604,17 @@ def ref_key(card, face):
         variant = "legendary" if typecat == "planeswalker" else f"legendary_{typecat}"
         if crowned and typecat != "planeswalker":
             variant += "_crowned"
+    elif base == "default":
+        # creature and non-creature default frames differ, legendary or not
+        variant = typecat
     else:
         variant = "default"
     # frame-effect buckets ("legendary" is carried by the variant, "spree" by
     # the base) plus the holostamp, all as "+" extras of the key
     buckets = sorted({b for b in (effect_bucket(e) for e in effects) if b})
-    stamp = stamp_of(card, face)
+    if is_back:
+        buckets = [b for b in buckets if b not in ("dfc", "fandfc")]
+    stamp = None if is_back else stamp_of(card, face)
     extras = {b for b in buckets if b not in ("legendary", "spree")}
     if stamp:
         extras.add(stamp_key(stamp))
@@ -578,9 +629,12 @@ def ref_search_query(base, layout, era, legendary, buckets, typecat,
     """Scryfall query for a white card with the same frame characteristics.
 
     Frame era, layout, the legendary crown (frame effect "legendary", Dominaria
-    2018-04-27 onward), the frame-effect buckets and the holostamp (stamp:
-    raw security_stamp of the asked card, None = no stamp) are matched with
-    layout: / frame: / date / kw: / r: / is: qualifiers."""
+    2018-04-27 onward), the card type (creature / non-creature - also for the
+    default base, legendary or not), the frame-effect buckets and the
+    holostamp (stamp: raw security_stamp of the asked card, None = no stamp,
+    aliased via stamp_key so e.g. "acorn" queries as the oval stamp) are
+    matched with layout: / frame: / date / kw: / t: / r: / is: qualifiers.
+    Alpha (lea) is always excluded - Beta (leb) is taken instead."""
     if base.startswith("split_"):
         parts = ["layout:split", f"frame:{era}"]
         sub = base.split("_", 1)[1]
@@ -592,13 +646,21 @@ def ref_search_query(base, layout, era, legendary, buckets, typecat,
         parts = ["t:planeswalker", f"frame:{era}"]
     elif base == "spree":
         parts = ["kw:spree", f"frame:{era}"]
-    elif base in ("saga", "battle", "modal", "leveler", "meld"):
+    elif base == "room":
+        # rooms have a split layout but their own frame: query the room type
+        parts = ["t:room", f"frame:{era}"]
+    elif base == "battle":
+        # layout:battle is not a Scryfall search qualifier - the card type
+        # identifies battles
+        parts = ["t:battle", f"frame:{era}"]
+    elif base in ("saga", "modal", "leveler", "meld"):
         # class/case share the saga frame, so query sagas for them
         lay = "saga" if base == "saga" else layout
         parts = [f"layout:{lay}", f"frame:{era}"]
     else:
         # normal and the same-as-normal layouts: the frame era alone
         parts = [f"frame:{era}"]
+    parts.append("-set:lea")           # Alpha is never chosen, Beta (leb) instead
     parts.append("c=w")                # Magic color white: border very distinct
     # the holostamp is part of the mask, so the reference must carry the same
     # stamp: the regular oval stamp (r>=rare, not Universes Beyond) or a
@@ -606,7 +668,7 @@ def ref_search_query(base, layout, era, legendary, buckets, typecat,
     # no stamp no query clause is needed - the client-side security_stamp
     # check in find_white_reference drops stamped candidates (frames older
     # than 2015 never had stamps, and there the check passes trivially)
-    if stamp == "oval":
+    if stamp_key(stamp) == "stamp":
         parts.extend(["r>=rare", "-is:universesbeyond"])
     elif stamp:
         parts.extend(["r>=rare", "is:universesbeyond"])
@@ -619,6 +681,9 @@ def ref_search_query(base, layout, era, legendary, buckets, typecat,
         elif era in ("2015", "future"):
             # crownless 2015-frame printings all predate Dominaria
             parts.append(f"date<{CROWN_DATE}")
+    if legendary or base == "default":
+        # creature and non-creature default frames differ (power/toughness
+        # box), legendary or not
         if typecat == "creature":
             parts.append("t:creature")
         elif typecat == "other":
@@ -627,6 +692,19 @@ def ref_search_query(base, layout, era, legendary, buckets, typecat,
     for b in sorted(set(buckets) - {"legendary", "spree"}):
         parts.append(BUCKET_QUERY.get(b, f"frame:{b}"))
     return " ".join(parts)
+
+
+def card_png(c):
+    """PNG image URI of a card - card-level, or the first face carrying one
+    (multi-faced cards such as transform cards only have image_uris on their
+    faces, not on the card itself)."""
+    png = (c.get("image_uris") or {}).get("png")
+    if not png:
+        for f in c.get("card_faces") or []:
+            png = (f.get("image_uris") or {}).get("png")
+            if png:
+                break
+    return png
 
 
 def find_white_reference(query, legendary=False, typecat=None, era=None,
@@ -644,17 +722,33 @@ def find_white_reference(query, legendary=False, typecat=None, era=None,
     crowned / transforming / stamped card. When no mono-white candidate exists,
     the first candidate with white in one of its faces and black in none of
     them is used instead (a black-containing face means a black frame, where
-    the border is not distinct)."""
+    the border is not distinct). A foil-only printing and an Alpha (lea)
+    printing are never selected when another candidate exists; the stamp is
+    compared via stamp_key, so aliased stamps (e.g. acorn = oval) match."""
     results = search_cards(query, paginate=False)
+    # white in the card's colors or in one of its faces, and a png somewhere
+    # (two-faced cards can have a null card-level colors and no card-level
+    # image_uris while a face is white and has the image, e.g. battles)
     cands = [c for c in results
-             if (c.get("image_uris") or {}).get("png") and "W" in (c.get("colors") or [])]
+             if card_png(c)
+             and ("W" in (c.get("colors") or [])
+                  or any("W" in (f.get("colors") or [])
+                         for f in (c.get("card_faces") or [])))]
+    # a foil-only printing is never selected when a non-foil one exists
+    nonfoil = [c for c in cands if not (c.get("foil") and not c.get("nonfoil"))]
+    if nonfoil:
+        cands = nonfoil
+    # Alpha (lea) is never chosen - Beta (leb) or another set instead
+    non_lea = [c for c in cands if (c.get("set") or "").lower() != "lea"]
+    if non_lea:
+        cands = non_lea
     if meld_back:
         # only other meld backs (letter-suffixed collector numbers) match
         cands = [c for c in cands
                  if re.search(r"[a-z]$", str(c.get("collector_number") or ""))]
     if era:
         cands = [c for c in cands if str(c.get("frame")) == str(era)]
-    cands = [c for c in cands if stamp_of(c) == (stamp or None)]
+    cands = [c for c in cands if stamp_key(stamp_of(c)) == stamp_key(stamp)]
     if legendary:
         cands = [c for c in cands if "legendary" in (c.get("type_line") or "").lower()]
         if crowned:
@@ -716,7 +810,7 @@ def reference_mask(key, card, face, ref_dir, args):
     print(f"  generating new mask '{key}' from white reference "
           f"'{ref.get('name')}' ({ref.get('set')}/{ref.get('collector_number')}, "
           f"stamp {ref.get('security_stamp') or 'none'})")
-    png = (ref.get("image_uris") or {}).get("png")
+    png = card_png(ref)
     img = Image.open(io.BytesIO(http_get(png)))
     region, border_hex = detect_region(
         img, threshold=args.threshold, max_hole=args.max_hole)
