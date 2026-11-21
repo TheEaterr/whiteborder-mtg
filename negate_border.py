@@ -89,7 +89,7 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 # / white-ish) - not negated
 INNER_EDGE_MARK = 0.5
 FLAT_EDGE_MARK = 0.25
-FLAT_EDGE_PX = 2
+FLAT_EDGE_PX = 3
 
 # mask alignment: a reference mask is built from another card's scan and
 # Scryfall scans of the same layout are not pixel-identical, so before
@@ -100,7 +100,7 @@ FLAT_EDGE_PX = 2
 # would shrink the mask below ALIGN_MIN_COVER of its size is rejected
 ALIGN_MAX_SHIFT = 3       # max shift in each direction, px
 ALIGN_MAX_GROW = 2        # max grow (+) / shrink (-), px
-ALIGN_BORDER_WEIGHT = 0.03  # weight of uncovered border pixels in the cost
+ALIGN_BORDER_WEIGHT = 1  # weight of uncovered border pixels in the cost
 ALIGN_MIN_COVER = 0.6     # min fraction of the original mask size to keep
 
 # mask cache next to the script; when the script itself lives in a read-only
