@@ -16,18 +16,28 @@ card itself and the resulting mask is cached under the same key as well.
 The border color of the processed card is sampled from its bottom edge and
 reported, but the border region itself comes from the reference mask.
 
-Inside the border the card is inverted (negative filter, 255 - pixel); the
-border region is grown by one pixel into the card interior and the innermost
-line of that grown region carries mask value 0.5, applied lightened
-(max(original, 255 - original) per channel) so no dark line can appear
-between the white border and the card, and that line is not part of the
-border itself. The outermost pixel line of the card is negated like the rest
-of the border.
+Inside the border the card is inverted (negative filter, 255 - pixel). Going
+inward, the last few lines of the border mask are not negated: the FLAT_EDGE_PX
+lines just inside the negated border are painted with the flat NEGATED border
+color of the card (255 minus the border color sampled from its bottom edge, so
+light / white-ish), and the innermost line, right at the card interior, is a
+50/50 blend between the pixel (not negated) and that flat color - the small
+gray line. The border region is grown by one pixel
+into the card interior first, so the flat band and the blend sit right at the
+border's inner edge; the outermost pixel line of the card is negated like the
+rest of the border.
 Enclosed pockets inside the border (the copyright / rarity / set info text
 in the black bottom band, and the holostamp - the regular oval stamp or the
 Universes Beyond triangle stamp, whatever its position in the bottom band)
 are part of the mask and are negated along with the border. The alpha
 channel is never touched, so rounded corners stay clean.
+
+A reference mask is built from another card's scan, and Scryfall scans of the
+same layout are not pixel-identical, so before applying a reference mask it
+is slightly adjusted (shifted by a few pixels and/or grown/shrunk by a pixel
+or two) to fit the actual card: the adjustment minimizes the number of
+covered non-black pixels while keeping the black border fully covered, is
+limited to small moves, and never shrinks the mask away.
 
 Local image files / directories are processed the same way, except that the
 border is detected on the image itself (no Scryfall reference is used).
@@ -71,11 +81,27 @@ USER_AGENT = "magic-frame/1.0 (negate-border card tool)"
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
-# mask value of the innermost line of pixels of the border region (one pixel
-# inside the border); applied lightened - max(original, 255 - original) per
-# channel - so it can never be darker than the negated border and no dark
-# line shows between the white border and the card
+# mask values of the inner edge of the border region: the innermost line
+# carries INNER_EDGE_MARK and is applied as a 50/50 blend between the pixel
+# (not negated) and the flat color (the small gray line); the next FLAT_EDGE_PX lines
+# out carry FLAT_EDGE_MARK and are applied as the flat NEGATED border color of
+# the card (255 minus the border color sampled from its bottom edge, so light
+# / white-ish) - not negated
 INNER_EDGE_MARK = 0.5
+FLAT_EDGE_MARK = 0.25
+FLAT_EDGE_PX = 2
+
+# mask alignment: a reference mask is built from another card's scan and
+# Scryfall scans of the same layout are not pixel-identical, so before
+# applying it the mask is nudged to fit the actual card. The search is
+# limited to small adjustments, the cost is the number of covered NON-black
+# pixels (kept low) plus a weighted count of border pixels left uncovered
+# (never leave part of the black border visible), and an adjustment that
+# would shrink the mask below ALIGN_MIN_COVER of its size is rejected
+ALIGN_MAX_SHIFT = 3       # max shift in each direction, px
+ALIGN_MAX_GROW = 2        # max grow (+) / shrink (-), px
+ALIGN_BORDER_WEIGHT = 0.03  # weight of uncovered border pixels in the cost
+ALIGN_MIN_COVER = 0.6     # min fraction of the original mask size to keep
 
 # mask cache next to the script; when the script itself lives in a read-only
 # location (e.g. the nix store via `nix run`), fall back to ./ref_masks
@@ -385,6 +411,15 @@ def shift(mask, dy, dx):
     return out
 
 
+def shift_clamp(mask, dy, dx):
+    """mask shifted by (dy, dx), edge-replicated at the image borders - the
+    card is cut off at the image edge, so its mask continues beyond it."""
+    h, w = mask.shape
+    ys = np.clip(np.arange(h) - dy, 0, h - 1)
+    xs = np.clip(np.arange(w) - dx, 0, w - 1)
+    return mask[np.ix_(ys, xs)]
+
+
 def dilate8(mask):
     out = mask.copy()
     for dy in (-1, 0, 1):
@@ -398,6 +433,31 @@ def erode4(mask):
     out = mask.copy()
     for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
         out &= shift(mask, dy, dx)
+    return out
+
+
+def erode4_clamp(mask, card):
+    """erode4 over the card domain: neighbors outside the card (image border
+    or rounded corners) count as inside the mask - the card is cut off at
+    the image edge, so the mask's outer edge is not eroded, only its inner
+    boundary moves."""
+    out = mask.copy()
+    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        out &= shift_clamp(mask, dy, dx) | ~shift(card, dy, dx)
+    return out
+
+
+def dilate_n(mask, n):
+    out = mask
+    for _ in range(n):
+        out = dilate8(out)
+    return out
+
+
+def erode_n_clamp(mask, n, card):
+    out = mask
+    for _ in range(n):
+        out = erode4_clamp(out, card)
     return out
 
 
@@ -455,7 +515,8 @@ def detect_border_color(sub, card):
 def detect_region(img, threshold=32, max_hole=20000):
     """Detect the border region of a card image.
 
-    Returns (region mask or None, border color hex)."""
+    Returns (region mask or None, border color as RGB array or None, border
+    color hex)."""
     full = np.asarray(img.convert("RGBA"))
     card_full = card_mask(img)
     ys, xs = np.where(card_full)
@@ -471,7 +532,7 @@ def detect_region(img, threshold=32, max_hole=20000):
     hexc = "none" if border is None else \
         "#{:02X}{:02X}{:02X}".format(*(int(round(c)) for c in border))
     if border is None:
-        return None, hexc
+        return None, None, hexc
 
     # border pixels = within threshold of the detected border color (per channel)
     dist = np.abs(sub[..., :3].astype(np.int16) - border.astype(np.int16)).max(axis=2)
@@ -488,20 +549,132 @@ def detect_region(img, threshold=32, max_hole=20000):
 
     region_full = np.zeros(card_full.shape, bool)
     region_full[y0:y1, x0:x1] = region
-    return region_full, hexc
+    return region_full, border, hexc
+
+
+def inner_lines(region, card, n):
+    """The n innermost 1px lines of region, from inside out (region is not
+    modified)."""
+    lines = []
+    r = region.copy()
+    outside = card & ~region
+    for _ in range(n):
+        line = r & dilate8(outside)
+        if not line.any():
+            break
+        lines.append(line)
+        r &= ~line
+        outside |= line
+    return lines
+
+
+def float_mask_from_region(region, card):
+    """Grayscale float mask from a card-clipped border region: 1.0 inside, the
+    innermost line INNER_EDGE_MARK (applied as a blend - the small gray line),
+    the next FLAT_EDGE_PX lines out FLAT_EDGE_MARK (applied as the flat negated
+    border color, not negated), 0 outside."""
+    m = np.zeros(region.shape, np.float32)
+    m[region] = 1.0
+    for i, line in enumerate(inner_lines(region, card, FLAT_EDGE_PX + 1)):
+        m[line] = INNER_EDGE_MARK if i == 0 else FLAT_EDGE_MARK
+    return m
 
 
 def mask_from_region(region, card):
     """Grayscale float mask from a binary border region: the region is grown by
-    one pixel into the card interior first, so the lightened line is not part
-    of the border itself. 1 inside the grown region, INNER_EDGE_MARK on its
-    innermost line of pixels (applied lightened), 0 outside."""
-    region = dilate8(region) & card
-    inner = region & dilate8(card & ~region)
-    m = np.zeros(region.shape, np.float32)
-    m[region] = 1.0
-    m[inner] = INNER_EDGE_MARK
-    return m
+    one pixel into the card interior first, so the flat/blend inner edge is
+    not part of the border itself."""
+    return float_mask_from_region(dilate8(region) & card, card)
+
+
+def resize_mask(mask, h, w):
+    """Resize a mask to (h, w) with NEAREST, so the 0 / 0.5 / 1 values survive."""
+    if mask.shape != (h, w):
+        mask = np.asarray(
+            Image.fromarray((mask * 255).round().astype(np.uint8), "L")
+            .resize((w, h), Image.NEAREST), dtype=np.float32) / 255.0
+    return mask
+
+
+# ------------------------------------------------------- mask alignment
+
+def align_mask(mask, img, border, threshold=32):
+    """Nudge a reference mask (shift / grow / shrink) to fit the card image.
+
+    Scryfall scans of the same layout differ by a few pixels, so the mask
+    built from the reference card can sit slightly off on the asked card.
+    The covered region is searched over shifts of +/- ALIGN_MAX_SHIFT px and
+    grows/shrinks of +/- ALIGN_MAX_GROW px; the cost of a candidate is the
+    number of covered pixels that are NOT border-colored (non-black covered,
+    kept low) plus ALIGN_BORDER_WEIGHT times the number of border pixels it
+    leaves uncovered (the black border must stay fully covered). The identity
+    transform is always a candidate and wins ties, so a mask that already fits
+    is returned unchanged; an adjustment shrinking the mask below
+    ALIGN_MIN_COVER of its original size is rejected.
+
+    Returns (mask, info or None) - info describes the applied adjustment."""
+    if border is None:
+        return mask, None
+    arr = np.asarray(img.convert("RGB"))
+    card = card_mask(img)
+    dist = np.abs(arr.astype(np.int16) - np.asarray(border, dtype=np.int16)).max(axis=2)
+    nonblack = (dist > threshold) & card
+    region = mask > 0
+    if not region.any():
+        return mask, None
+    # the card's own border, detected in a band around the reference mask -
+    # the band keeps the flood from leaking into a dark card frame
+    band = dilate_n(region, ALIGN_MAX_SHIFT + ALIGN_MAX_GROW + 3) & card
+    black = (dist <= threshold) & card
+    edge = card & ~erode4(card)
+    local = black & band
+    local_border = flood_from_edges(local, local & edge)
+    if not local_border.any():
+        return mask, None
+    total_border = int(local_border.sum())
+    base = int(region.sum())
+    shifts = sorted(((dy, dx)
+                     for dy in range(-ALIGN_MAX_SHIFT, ALIGN_MAX_SHIFT + 1)
+                     for dx in range(-ALIGN_MAX_SHIFT, ALIGN_MAX_SHIFT + 1)),
+                    key=lambda s: abs(s[0]) + abs(s[1]))
+    grow_order = [0]
+    for k in range(1, ALIGN_MAX_GROW + 1):
+        grow_order += [k, -k]
+    grows = {}
+    excls = {}    # innermost FLAT_EDGE_PX+1 lines of each grown region - they
+    # are not fully negated (flat negated border color / blend line), so they
+    # must not count as covered non-black
+    for g in grow_order:
+        if g == 0:
+            r = region
+        elif g > 0:
+            r = dilate_n(region, g)
+        else:
+            # shrink: pull the inner boundary in, keep the outer edge (the
+            # card is cut off at the image edge)
+            r = erode_n_clamp(region, -g, card)
+        grows[g] = r & card
+        ls = inner_lines(grows[g], card, FLAT_EDGE_PX + 1)
+        excls[g] = np.logical_or.reduce(ls) if ls else np.zeros_like(grows[g])
+    best = None  # (cost, dy, dx, g, fp, fn)
+    for dy, dx in shifts:
+        for g, r in grows.items():
+            rc = shift_clamp(r, dy, dx) & card
+            excl = shift_clamp(excls[g], dy, dx) & card
+            fp = int((rc & ~excl & nonblack).sum())             # covered non-black px
+            fn = total_border - int((rc & local_border).sum())  # border px uncovered
+            cost = fp + ALIGN_BORDER_WEIGHT * fn
+            if best is None or cost < best[0]:
+                best = (cost, dy, dx, g, fp, fn)
+    _cost, dy, dx, g, fp, fn = best
+    if (dy, dx, g) == (0, 0, 0):
+        return mask, None
+    r = shift_clamp(grows[g], dy, dx) & card
+    if r.sum() < ALIGN_MIN_COVER * base:
+        return mask, None
+    m = float_mask_from_region(r, card)
+    info = {"shift": (dy, dx), "grow": g, "fp": fp, "fn": fn}
+    return m, info
 
 
 # ------------------------------------------------------- reference cards
@@ -521,8 +694,9 @@ def ref_key(card, face):
     "default" for normal and the same-as-normal layouts - e.g. leveler exists
     both as 2003_leveler and 2015_leveler;
     variant: legendary (crowned, plus creature/non-creature) when legendary;
-    for the default base also creature/other when not legendary - creature
-    and non-creature default frames differ (power/toughness box);
+    for the default base also creature/other when not legendary - but only
+    in the 2015 frame, where creature and non-creature default frames differ
+    (power/toughness box); the other frames share one border ring;
     extras: one per relevant frame-effect bucket (dfc, fandfc, unknown) plus
     the holostamp (stamp, or stamp_<value>, e.g. stamp_triangle for the
     Universes Beyond stamp).
@@ -604,8 +778,10 @@ def ref_key(card, face):
         variant = "legendary" if typecat == "planeswalker" else f"legendary_{typecat}"
         if crowned and typecat != "planeswalker":
             variant += "_crowned"
-    elif base == "default":
-        # creature and non-creature default frames differ, legendary or not
+    elif base == "default" and era == "2015":
+        # only the 2015 frame differentiates creature and non-creature
+        # default frames (power/toughness box), legendary or not - the
+        # 1993/1997/2003/future frames share one border ring
         variant = typecat
     else:
         variant = "default"
@@ -629,8 +805,8 @@ def ref_search_query(base, layout, era, legendary, buckets, typecat,
     """Scryfall query for a white card with the same frame characteristics.
 
     Frame era, layout, the legendary crown (frame effect "legendary", Dominaria
-    2018-04-27 onward), the card type (creature / non-creature - also for the
-    default base, legendary or not), the frame-effect buckets and the
+    2018-04-27 onward), the card type (creature / non-creature - for the default
+    base in the 2015 frame only, legendary or not), the frame-effect buckets and the
     holostamp (stamp: raw security_stamp of the asked card, None = no stamp,
     aliased via stamp_key so e.g. "acorn" queries as the oval stamp) are
     matched with layout: / frame: / date / kw: / t: / r: / is: qualifiers.
@@ -681,9 +857,10 @@ def ref_search_query(base, layout, era, legendary, buckets, typecat,
         elif era in ("2015", "future"):
             # crownless 2015-frame printings all predate Dominaria
             parts.append(f"date<{CROWN_DATE}")
-    if legendary or base == "default":
-        # creature and non-creature default frames differ (power/toughness
-        # box), legendary or not
+    if legendary or (base == "default" and era == "2015"):
+        # creature and non-creature frames differ (power/toughness box) only
+        # in the 2015 frame, legendary or not; the other frames share one
+        # border ring
         if typecat == "creature":
             parts.append("t:creature")
         elif typecat == "other":
@@ -812,7 +989,7 @@ def reference_mask(key, card, face, ref_dir, args):
           f"stamp {ref.get('security_stamp') or 'none'})")
     png = card_png(ref)
     img = Image.open(io.BytesIO(http_get(png)))
-    region, border_hex = detect_region(
+    region, _border, border_hex = detect_region(
         img, threshold=args.threshold, max_hole=args.max_hole)
     if region is None or not region.any():
         return None, None
@@ -827,30 +1004,40 @@ def reference_mask(key, card, face, ref_dir, args):
 
 # ------------------------------------------------------------------ pipeline
 
-def apply_mask(img, mask, scale=1.0, mpc=False):
+def apply_mask(img, mask, border=None, scale=1.0, mpc=False):
     """Negate the card inside the border mask.
 
-    mask 1 (resized to the card, NEAREST so the 0 / 0.5 / 1 values survive) ->
-    pixel inverted (255 - pixel); the innermost border line (0 < mask < 1) ->
-    lightened to max(original, 255 - original) per channel (opaque, so no
-    dark line can show between the negated border and the card); 0 ->
-    untouched. Returns (image, weight, frac, inner)."""
+    mask 1 (resized to the card, NEAREST so the mask levels survive) -> pixel
+    inverted (255 - pixel); mask FLAT_EDGE_MARK (0 < mask < INNER_EDGE_MARK)
+    -> the flat NEGATED border color (255 - border, border: the detected
+    border color of this card), NOT negated; mask INNER_EDGE_MARK
+    (INNER_EDGE_MARK <= mask < 1) -> a 50/50 blend between the pixel (not
+    negated) and the flat negated border color (the small gray line);
+    0 -> untouched.
+    Without a border color the flat lines are negated and the blend line is
+    lightened (max(original, 255 - original)) as before.
+    Returns (image, weight, frac, inner_edge)."""
     arr = np.asarray(img.convert("RGBA")).copy()
     cmask = card_mask(img)
     h, w = cmask.shape
-    if mask.shape != (h, w):
-        mask = np.asarray(
-            Image.fromarray((mask * 255).round().astype(np.uint8), "L")
-            .resize((w, h), Image.NEAREST), dtype=np.float32) / 255.0
-    weight = (mask >= 1.0) & cmask          # full negate
-    inner = (mask > 0.0) & (mask < 1.0) & cmask  # innermost line -> blend
+    mask = resize_mask(mask, h, w)
+    weight = (mask >= 1.0) & cmask                          # full negate
+    flat = (mask > 0.0) & (mask < INNER_EDGE_MARK) & cmask  # flat border color
+    inner = (mask >= INNER_EDGE_MARK) & (mask < 1.0) & cmask  # blend line
     a = weight[..., None].astype(np.float32)
     rgb = arr[..., :3].astype(np.float32)
     arr[..., :3] = np.round(rgb * (1 - a) + (255.0 - rgb) * a).astype(np.uint8)
-    # innermost line: lightened (never darker than the negated border), so
-    # the white border blends into the card without a dark line - negating a
-    # light card-edge pixel would produce a black line on white cards
-    arr[..., :3][inner] = np.maximum(rgb[inner], 255.0 - rgb[inner]).astype(np.uint8)
+    if border is not None:
+        bcol = np.asarray(border, dtype=np.float32)
+        flat_col = 255.0 - bcol  # negated border color (light, ~white)
+        # FLAT_EDGE_MARK lines: the flat negated border color, not negated
+        arr[..., :3][flat] = np.round(flat_col).astype(np.uint8)
+        # INNER_EDGE_MARK line: 50/50 between the pixel (not negated) and the
+        # flat negated border color - the small gray line at the inner edge
+        arr[..., :3][inner] = np.round(0.5 * rgb[inner] + 0.5 * flat_col).astype(np.uint8)
+    else:
+        arr[..., :3][flat] = np.round(255.0 - rgb[flat]).astype(np.uint8)
+        arr[..., :3][inner] = np.maximum(rgb[inner], 255.0 - rgb[inner]).astype(np.uint8)
     out = Image.fromarray(arr, "RGBA")
     if mpc:
         out = out.resize(MPC_SIZE, Image.LANCZOS)
@@ -858,7 +1045,7 @@ def apply_mask(img, mask, scale=1.0, mpc=False):
         out = out.resize((max(1, round(out.width * scale)),
                           max(1, round(out.height * scale))), Image.LANCZOS)
     frac = 100.0 * weight.sum() / max(1, cmask.sum())
-    return out, weight.astype(np.float32), frac, inner
+    return out, weight.astype(np.float32), frac, inner | flat
 
 
 def process_image(img, args, card=None, face=None):
@@ -869,7 +1056,7 @@ def process_image(img, args, card=None, face=None):
     reference exists) it is detected on the image itself - and, when a key is
     known, cached under that key so later runs load it instead of
     re-detecting."""
-    region, border_hex = detect_region(
+    region, border, border_hex = detect_region(
         img, threshold=args.threshold, max_hole=args.max_hole)
     stats = {"found": False, "frac": 0.0, "border": border_hex, "mask": "none"}
 
@@ -887,6 +1074,21 @@ def process_image(img, args, card=None, face=None):
         if mask is None:
             print(f"  warning: no white reference card found for '{key}' "
                   f"- detecting the border on the card itself")
+        else:
+            # the mask comes from another card's scan: nudge it to fit this
+            # one (self-detected masks are skipped - they already fit)
+            cmask = card_mask(img)
+            mask = resize_mask(mask, cmask.shape[0], cmask.shape[1])
+            mask, info = align_mask(mask, img, border, threshold=args.threshold)
+            if info is None:
+                # no adjustment: re-derive the mask levels so old cache
+                # entries (without the flat inner band) get them too
+                mask = float_mask_from_region(mask > 0, cmask)
+            if info:
+                print(f"  adjusted mask to the card: shift {info['shift']}, "
+                      f"grow {info['grow']} -> {info['fp']} non-black px covered, "
+                      f"{info['fn']} border px uncovered")
+                src = f"{src} (aligned: shift {info['shift']}, grow {info['grow']})"
     if mask is None:
         if region is None or not region.any():
             print(f"  warning: could not detect a border (color {border_hex}), "
@@ -906,15 +1108,16 @@ def process_image(img, args, card=None, face=None):
             print(f"  saved new mask to {path}")
             src = f"self-detected on '{card.get('name')}' -> {path}"
 
-    out, _weight, frac, inner = apply_mask(img, mask, scale=args.scale, mpc=args.mpc)
+    out, _weight, frac, inner = apply_mask(img, mask, border=border,
+                                           scale=args.scale, mpc=args.mpc)
     stats.update(found=True, frac=frac, mask=src, inner=int(inner.sum()))
     return out, stats
 
 
 def report(tag, dst, out, stats):
     print(f"{tag} -> {dst}  (border color {stats.get('border')}, mask: {stats.get('mask')}, "
-          f"{stats['frac']:.1f}% of card negated, {stats.get('inner', 0)} px inner line "
-          f"lightened, {out.width}x{out.height})")
+          f"{stats['frac']:.1f}% of card negated, {stats.get('inner', 0)} px inner edge "
+          f"flat/blended, {out.width}x{out.height})")
 
 
 def process_file(src, dst, args):
