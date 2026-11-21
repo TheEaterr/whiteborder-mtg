@@ -16,16 +16,18 @@ card itself and the resulting mask is cached under the same key as well.
 The border color of the processed card is sampled from its bottom edge and
 reported, but the border region itself comes from the reference mask.
 
-Inside the border the card is inverted (negative filter, 255 - pixel). Going
-inward, the last few lines of the border mask are not negated: the FLAT_EDGE_PX
-lines just inside the negated border are painted with the flat NEGATED border
+Inside the border the card is inverted (negative filter, 255 - pixel). The
+innermost band of the border mask (the innermost line, then the next
+FLAT_EDGE_PX flat lines) is not fully negated: on those pixels the NEW border
 color of the card (255 minus the border color sampled from its bottom edge, so
-light / white-ish), and the innermost line, right at the card interior, is a
-50/50 blend between the pixel (not negated) and that flat color - the small
-gray line. The border region is grown by one pixel
-into the card interior first, so the flat band and the blend sit right at the
-border's inner edge; the outermost pixel line of the card is negated like the
-rest of the border.
+light / white-ish) is blended in, each pixel using its own mask gray value as
+the blend weight:
+    new = new_border * gray + old * (1 - gray)
+so the innermost line is a 50/50 blend and the flat lines a 25% blend - the
+gray values are read from the mask itself, so masks with varying grays in the
+band are handled the same way. The border region is grown by one pixel into
+the card interior first, so the band sits right at the border's inner edge;
+the outermost pixel line of the card is negated like the rest of the border.
 Enclosed pockets inside the border (the copyright / rarity / set info text
 in the black bottom band, and the holostamp - the regular oval stamp or the
 Universes Beyond triangle stamp, whatever its position in the bottom band)
@@ -81,15 +83,17 @@ USER_AGENT = "magic-frame/1.0 (negate-border card tool)"
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
-# mask values of the inner edge of the border region: the innermost line
-# carries INNER_EDGE_MARK and is applied as a 50/50 blend between the pixel
-# (not negated) and the flat color (the small gray line); the next FLAT_EDGE_PX lines
-# out carry FLAT_EDGE_MARK and are applied as the flat NEGATED border color of
-# the card (255 minus the border color sampled from its bottom edge, so light
-# / white-ish) - not negated
+# mask values of the inner edge of the border mask, as stamped by
+# float_mask_from_region: the innermost line carries INNER_EDGE_MARK (a 50/50
+# blend), the next FLAT_EDGE_PX lines out carry FLAT_EDGE_MARK (the flat
+# lines); elsewhere mask 1 is fully negated (255 - pixel), 0 is untouched.
+# At apply time the gray value of each mask pixel is read from the mask itself
+# and used as the blend weight toward the NEW border color of the card (255
+# minus the detected border color, so light / white-ish):
+#     new = new_border * gray + old * (1 - gray)
 INNER_EDGE_MARK = 0.5
 FLAT_EDGE_MARK = 0.25
-FLAT_EDGE_PX = 3
+FLAT_EDGE_PX = 2
 
 # mask alignment: a reference mask is built from another card's scan and
 # Scryfall scans of the same layout are not pixel-identical, so before
@@ -100,8 +104,9 @@ FLAT_EDGE_PX = 3
 # would shrink the mask below ALIGN_MIN_COVER of its size is rejected
 ALIGN_MAX_SHIFT = 3       # max shift in each direction, px
 ALIGN_MAX_GROW = 2        # max grow (+) / shrink (-), px
-ALIGN_BORDER_WEIGHT = 1  # weight of uncovered border pixels in the cost
+ALIGN_BORDER_WEIGHT = 10  # weight of uncovered border pixels in the cost
 ALIGN_MIN_COVER = 0.6     # min fraction of the original mask size to keep
+ALIGNEMENT_THRESHOLD = 8
 
 # mask cache next to the script; when the script itself lives in a read-only
 # location (e.g. the nix store via `nix run`), fall back to ./ref_masks
@@ -273,6 +278,10 @@ def add_common_filters(uri):
     for i, (k, v) in enumerate(params):
         if k == "q" and "(game:paper)" not in v.split() and "-(game:paper)" not in v.split():
             params[i] = (k, "(game:paper) " + v)
+            break
+    for i, (k, v) in enumerate(params):
+        if k == "q" and "border:black" not in v.split() and "-border:black" not in v.split():
+            params[i] = (k, "border:black " + v)
             break
     return urllib.parse.urlunsplit(
         (u.scheme, u.netloc, u.path, urllib.parse.urlencode(params), u.fragment))
@@ -569,14 +578,15 @@ def inner_lines(region, card, n):
 
 
 def float_mask_from_region(region, card):
-    """Grayscale float mask from a card-clipped border region: 1.0 inside, the
-    innermost line INNER_EDGE_MARK (applied as a blend - the small gray line),
-    the next FLAT_EDGE_PX lines out FLAT_EDGE_MARK (applied as the flat negated
-    border color, not negated), 0 outside."""
+    """Grayscale float mask from a card-clipped border region: 1.0 inside
+    (fully negated), the innermost line INNER_EDGE_MARK (a 50/50 blend), the
+    next FLAT_EDGE_PX lines out FLAT_EDGE_MARK (the flat lines), 0 outside.
+    The gray values are read from the mask at apply time and used as blend
+    weights, so masks with varying grays in the band work the same way."""
     m = np.zeros(region.shape, np.float32)
     m[region] = 1.0
     for i, line in enumerate(inner_lines(region, card, FLAT_EDGE_PX + 1)):
-        m[line] = INNER_EDGE_MARK if i == 0 else FLAT_EDGE_MARK
+        m[line] = (i + 1) / (FLAT_EDGE_PX + 1)
     return m
 
 
@@ -588,7 +598,7 @@ def mask_from_region(region, card):
 
 
 def resize_mask(mask, h, w):
-    """Resize a mask to (h, w) with NEAREST, so the 0 / 0.5 / 1 values survive."""
+    """Resize a mask to (h, w) with NEAREST, so the mask gray levels survive."""
     if mask.shape != (h, w):
         mask = np.asarray(
             Image.fromarray((mask * 255).round().astype(np.uint8), "L")
@@ -598,7 +608,7 @@ def resize_mask(mask, h, w):
 
 # ------------------------------------------------------- mask alignment
 
-def align_mask(mask, img, border, threshold=32):
+def align_mask(mask, img, border, threshold=8):
     """Nudge a reference mask (shift / grow / shrink) to fit the card image.
 
     Scryfall scans of the same layout differ by a few pixels, so the mask
@@ -642,7 +652,7 @@ def align_mask(mask, img, border, threshold=32):
         grow_order += [k, -k]
     grows = {}
     excls = {}    # innermost FLAT_EDGE_PX+1 lines of each grown region - they
-    # are not fully negated (flat negated border color / blend line), so they
+    # are not fully negated (the 50/50 blend line and the flat lines), so they
     # must not count as covered non-black
     for g in grow_order:
         if g == 0:
@@ -1008,36 +1018,35 @@ def apply_mask(img, mask, border=None, scale=1.0, mpc=False):
     """Negate the card inside the border mask.
 
     mask 1 (resized to the card, NEAREST so the mask levels survive) -> pixel
-    inverted (255 - pixel); mask FLAT_EDGE_MARK (0 < mask < INNER_EDGE_MARK)
-    -> the flat NEGATED border color (255 - border, border: the detected
-    border color of this card), NOT negated; mask INNER_EDGE_MARK
-    (INNER_EDGE_MARK <= mask < 1) -> a 50/50 blend between the pixel (not
-    negated) and the flat negated border color (the small gray line);
-    0 -> untouched.
-    Without a border color the flat lines are negated and the blend line is
-    lightened (max(original, 255 - original)) as before.
+    inverted (255 - pixel); 0 -> untouched. The inner edge pixels
+    (0 < mask < 1: the innermost blend/flat lines of the mask band) blend the
+    NEW border color of the card into the pixel, each with its own mask gray
+    value read from the mask as the blend weight:
+        new = new_border * gray + old * (1 - gray)
+    where new_border = 255 - border (border: the detected border color of this
+    card, so light / white-ish). Without a border color the inner edge pixels
+    are blended toward the negated pixel the same way.
     Returns (image, weight, frac, inner_edge)."""
     arr = np.asarray(img.convert("RGBA")).copy()
     cmask = card_mask(img)
     h, w = cmask.shape
     mask = resize_mask(mask, h, w)
-    weight = (mask >= 1.0) & cmask                          # full negate
-    flat = (mask > 0.0) & (mask < INNER_EDGE_MARK) & cmask  # flat border color
-    inner = (mask >= INNER_EDGE_MARK) & (mask < 1.0) & cmask  # blend line
+    weight = (mask >= 1.0) & cmask                       # full negate
+    inner = (mask > 0.0) & (mask < 1.0) & cmask          # inner edge
     a = weight[..., None].astype(np.float32)
     rgb = arr[..., :3].astype(np.float32)
     arr[..., :3] = np.round(rgb * (1 - a) + (255.0 - rgb) * a).astype(np.uint8)
+    gray = mask[inner].astype(np.float32)   # blend weight = mask gray value
     if border is not None:
-        bcol = np.asarray(border, dtype=np.float32)
-        flat_col = 255.0 - bcol  # negated border color (light, ~white)
-        # FLAT_EDGE_MARK lines: the flat negated border color, not negated
-        arr[..., :3][flat] = np.round(flat_col).astype(np.uint8)
-        # INNER_EDGE_MARK line: 50/50 between the pixel (not negated) and the
-        # flat negated border color - the small gray line at the inner edge
-        arr[..., :3][inner] = np.round(0.5 * rgb[inner] + 0.5 * flat_col).astype(np.uint8)
+        new_border = 255.0 - np.asarray(border, dtype=np.float32)  # light, ~white
+        arr[..., :3][inner] = np.round(
+            new_border * gray[:, None] + rgb[inner] * (1.0 - gray[:, None])
+        ).astype(np.uint8)
     else:
-        arr[..., :3][flat] = np.round(255.0 - rgb[flat]).astype(np.uint8)
-        arr[..., :3][inner] = np.maximum(rgb[inner], 255.0 - rgb[inner]).astype(np.uint8)
+        neg = 255.0 - rgb[inner]
+        arr[..., :3][inner] = np.round(
+            neg * gray[:, None] + rgb[inner] * (1.0 - gray[:, None])
+        ).astype(np.uint8)
     out = Image.fromarray(arr, "RGBA")
     if mpc:
         out = out.resize(MPC_SIZE, Image.LANCZOS)
@@ -1045,7 +1054,7 @@ def apply_mask(img, mask, border=None, scale=1.0, mpc=False):
         out = out.resize((max(1, round(out.width * scale)),
                           max(1, round(out.height * scale))), Image.LANCZOS)
     frac = 100.0 * weight.sum() / max(1, cmask.sum())
-    return out, weight.astype(np.float32), frac, inner | flat
+    return out, weight.astype(np.float32), frac, inner
 
 
 def process_image(img, args, card=None, face=None):
@@ -1079,10 +1088,10 @@ def process_image(img, args, card=None, face=None):
             # one (self-detected masks are skipped - they already fit)
             cmask = card_mask(img)
             mask = resize_mask(mask, cmask.shape[0], cmask.shape[1])
-            mask, info = align_mask(mask, img, border, threshold=args.threshold)
+            mask, info = align_mask(mask, img, border, threshold=ALIGNEMENT_THRESHOLD)
             if info is None:
                 # no adjustment: re-derive the mask levels so old cache
-                # entries (without the flat inner band) get them too
+                # entries (without the inner edge band) get them too
                 mask = float_mask_from_region(mask > 0, cmask)
             if info:
                 print(f"  adjusted mask to the card: shift {info['shift']}, "
