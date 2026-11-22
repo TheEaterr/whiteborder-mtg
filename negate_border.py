@@ -124,6 +124,13 @@ DEFAULT_REF_DIR = ((_SCRIPT_DIR / "ref_masks") if os.access(_SCRIPT_DIR, os.W_OK
 # with frame:legendary)
 CROWN_DATE = "2018-04-27"
 
+# First release date of a Marvel's Spider-Man-wave modal_dfc printing (the
+# pmei promo; the spm set itself is 2025-09-26, om1 2025-09-23): from this
+# date on, modal_dfc fronts carry the same DFC-style mark as transform cards.
+# Scryfall does not report that mark as a frame effect, so the dfc bucket is
+# assumed from the release date on
+SPIDERMAN_DATE = "2025-09-19"
+
 # ---------------------------------------------------------------- frame model
 # Scryfall frame effects mapped to the "bucket" they get in the reference key.
 # All DFC marks are the same icon in the same spot, so they share one bucket -
@@ -196,12 +203,13 @@ def stamp_of(card, face=None):
 
 # stamps sharing the regular oval stamp's artwork and position are aliased
 # to it
-STAMP_ALIASES = {"acorn": "oval"}
+STAMP_ALIASES = {"acorn": "oval", "heart": "oval"}
 
 
 def stamp_key(stamp):
     """Stamp component of a reference key: None (no stamp), "stamp" for the
-    regular oval stamp (and its aliases, e.g. "acorn"), "stamp_<value>" for
+    regular oval stamp (and its aliases, e.g. "acorn" or "heart"),
+    "stamp_<value>" for
     any other stamp (e.g. "stamp_triangle" for the Universes Beyond stamp).
     Stamped and non-stamped cards - and UB vs regular stamps - get different
     masks."""
@@ -756,7 +764,10 @@ def ref_key(card, face):
     has.
     A transform front always carries a DFC mark, so when Scryfall does not
     report the frame effect the dfc bucket is assumed (battles are exempt -
-    their transform layout carries no DFC mark).
+    their transform layout carries no DFC mark). From Marvel's Spider-Man
+    (SPIDERMAN_DATE) on, modal_dfc fronts carry the same DFC mark, which
+    Scryfall does not report either - the dfc bucket is assumed from the
+    release date.
     Each face of a two-faced card gets the characteristics of its own face:
     the face's frame_effects are used when Scryfall provides them (otherwise
     the card-level ones), and the type line is face-first - so e.g. the
@@ -851,12 +862,16 @@ def ref_key(card, face):
     if is_back:
         # a back side never carries the DFC mark
         buckets = [b for b in buckets if b not in ("dfc", "fandfc")]
-    elif (layout == "transform" and base != "battle"
-          and not {"dfc", "fandfc"} & set(buckets)):
+    elif not {"dfc", "fandfc"} & set(buckets) and (
+            (layout == "transform" and base != "battle")
+            or (layout == "modal_dfc"
+                and (card.get("released_at") or "") >= SPIDERMAN_DATE)):
         # a transform front always carries a DFC mark - when Scryfall does
         # not report the frame effect, the dfc bucket is assumed (fandfc is
         # its own mark and counts as one). Battles are exempt: their
-        # transform layout carries no DFC mark
+        # transform layout carries no DFC mark. From Marvel's Spider-Man
+        # (SPIDERMAN_DATE) on, a modal_dfc front carries the same mark,
+        # which Scryfall does not report either
         buckets = sorted(set(buckets) | {"dfc"})
     stamp = None if is_back else stamp_of(card, face)
     extras = {b for b in buckets if b not in ("legendary", "spree")}
@@ -872,7 +887,8 @@ def ref_key(card, face):
 
 
 def ref_search_query(base, layout, era, buckets, typecat,
-                     crowned=False, stamp=None, pw_back=False, back=False):
+                     crowned=False, stamp=None, pw_back=False, back=False,
+                     released_at=""):
     """Scryfall query for a white card with the same frame characteristics.
 
     Frame era, layout, the legendary crown (frame effect "legendary", Dominaria
@@ -881,14 +897,25 @@ def ref_search_query(base, layout, era, buckets, typecat,
     the 2015 frame only, or when crowned; not queried for a back side, see
     back=), the frame-effect buckets and the
     holostamp (stamp: raw security_stamp of the asked card, None = no stamp,
-    aliased via stamp_key so e.g. "acorn" queries as the oval stamp) are
-    matched with layout: / frame: / kw: / t: / r: / is: qualifiers - and every
+    queried directly as stamp:<value>, aliased so e.g. "acorn" queries as
+    stamp:oval) are
+    matched with layout: / frame: / kw: / t: / stamp: qualifiers - and every
     characteristic the asked card does NOT have is negated as well
     (-frame:..., -layout:..., -kw:..., -t:...), so results only contain cards
     with exactly the same frame. pw_back queries the unique back frame of
     transform cards that are planeswalkers on both sides.
+    A dfc bucket assumed from the release date (modal_dfc fronts from
+    Marvel's Spider-Man / SPIDERMAN_DATE on - Scryfall reports no frame
+    effect for that mark) is not queried as a frame effect; candidates are
+    matched client-side through their own key instead.
     Alpha (lea) is always excluded - Beta (leb) is taken instead."""
     want = set(buckets or ()) - {"legendary", "spree"}
+    if (layout == "modal_dfc" and "dfc" in want
+            and (released_at or "") >= SPIDERMAN_DATE):
+        # the dfc mark of a Spider-Man-era modal_dfc front is not a reported
+        # frame effect: query as if the card had no dfc bucket, the key
+        # comparison on the candidates adds it back
+        want = want - {"dfc"}
     if pw_back:
         # the unique back frame of transform cards that are planeswalkers on
         # both sides: only another such card has it (on its back side)
@@ -919,19 +946,19 @@ def ref_search_query(base, layout, era, buckets, typecat,
     else:
         # normal and the same-as-normal layouts: the frame era alone
         parts = [f"frame:{era}"]
-    parts.append("-set:lea")           # Alpha is never chosen, Beta (leb) instead
+    parts.append("-set:lea")
+    parts.append("-set:leb")           # Alpha and Beta are never chosen
     parts.append("c=w")                # Magic color white: border very distinct
     # the holostamp is part of the mask, so the reference must carry the same
-    # stamp: the regular oval stamp (r>=rare, not Universes Beyond) or a
-    # Universes Beyond stamp such as the triangle (is:universesbeyond). For
-    # no stamp no query clause is needed - the client-side key comparison in
-    # find_white_reference drops wrongly-stamped candidates (frames older
-    # than 2015 never had stamps, and there the key comparison passes
-    # trivially)
-    if stamp_key(stamp) == "stamp":
-        parts.extend(["r>=rare", "-is:universesbeyond"])
-    elif stamp:
-        parts.extend(["r>=rare", "is:universesbeyond"])
+    # stamp - searched directly (stamp:<value>, aliased via STAMP_ALIASES so
+    # e.g. "acorn" queries as the oval stamp, which shares its artwork and
+    # position). For no stamp no query clause is needed - the client-side key
+    # comparison in find_white_reference drops wrongly-stamped candidates
+    # (frames older than 2015 never had stamps, and there the key comparison
+    # passes trivially)
+    if stamp:
+        s = str(stamp).lower()
+        parts.append("stamp:" + STAMP_ALIASES.get(s, s))
     if crowned:
         # the legendary crown (frame effect "legendary", Dominaria 2018+);
         # t:legendary, not is:legendary - the latter matches non-legendary
@@ -1084,7 +1111,8 @@ def reference_mask(key, card, face, ref_dir, args):
     query = ref_search_query(spec.base, spec.layout, spec.era, spec.buckets,
                              spec.typecat, crowned=spec.crowned,
                              stamp=spec.stamp, pw_back=spec.pw_back,
-                             back=spec.is_back)
+                             back=spec.is_back,
+                             released_at=card.get("released_at") or "")
     ref = find_white_reference(query, key=key, back=spec.is_back)
     if ref is None:
         return None, None
