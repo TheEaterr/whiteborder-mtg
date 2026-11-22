@@ -3,7 +3,8 @@
 
 Given a Scryfall card link, the border is not taken from the asked card
 directly: the script first finds a reference card with all the same
-characteristics (frame era / layout / legendary / frame effects / holostamp)
+characteristics (frame era / layout / legendary crown / frame effects /
+holostamp)
 but of the Magic color white -
 e.g. a white saga such as Elspeth Conquers Death for the black saga Age of
 Ultron - where the black border is very distinct against the white frame,
@@ -17,17 +18,17 @@ The border color of the processed card is sampled from its bottom edge and
 reported, but the border region itself comes from the reference mask.
 
 Inside the border the card is inverted (negative filter, 255 - pixel). The
-innermost band of the border mask (the innermost line, then the next
-FLAT_EDGE_PX flat lines) is not fully negated: on those pixels the NEW border
-color of the card (255 minus the border color sampled from its bottom edge, so
-light / white-ish) is blended in, each pixel using its own mask gray value as
-the blend weight:
+innermost band of the border mask (FLAT_EDGE_PX + 1 lines) is not fully
+negated: on those pixels the NEW border color of the card (255 minus the
+border color sampled from its bottom edge, so light / white-ish) is blended
+in, each pixel using its own mask gray value as the blend weight:
     new = new_border * gray + old * (1 - gray)
-so the innermost line is a 50/50 blend and the flat lines a 25% blend - the
-gray values are read from the mask itself, so masks with varying grays in the
-band are handled the same way. The border region is grown by one pixel into
-the card interior first, so the band sits right at the border's inner edge;
-the outermost pixel line of the card is negated like the rest of the border.
+The band is stamped with an increasing gray gradient, so the blend gets
+stronger toward the negated border; the gray values are read from the mask
+itself, so masks with varying grays in the band are handled the same way.
+The border region is grown by one pixel into the card interior first, so the
+band sits right at the border's inner edge; the outermost pixel line of the
+card is negated like the rest of the border.
 Enclosed pockets inside the border (the copyright / rarity / set info text
 in the black bottom band, and the holostamp - the regular oval stamp or the
 Universes Beyond triangle stamp, whatever its position in the bottom band)
@@ -74,6 +75,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import namedtuple
 from pathlib import Path
 
 import numpy as np
@@ -84,15 +86,13 @@ USER_AGENT = "magic-frame/1.0 (negate-border card tool)"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
 # mask values of the inner edge of the border mask, as stamped by
-# float_mask_from_region: the innermost line carries INNER_EDGE_MARK (a 50/50
-# blend), the next FLAT_EDGE_PX lines out carry FLAT_EDGE_MARK (the flat
-# lines); elsewhere mask 1 is fully negated (255 - pixel), 0 is untouched.
-# At apply time the gray value of each mask pixel is read from the mask itself
-# and used as the blend weight toward the NEW border color of the card (255
-# minus the detected border color, so light / white-ish):
+# float_mask_from_region: the innermost FLAT_EDGE_PX+1 lines get an increasing
+# gray gradient (i+1)/(FLAT_EDGE_PX+1) from inside out (the blend band);
+# elsewhere in the region mask 1 is fully negated (255 - pixel), 0 is
+# untouched. At apply time the gray value of each mask pixel is read from the
+# mask itself and used as the blend weight toward the NEW border color of the
+# card (255 minus the detected border color, so light / white-ish):
 #     new = new_border * gray + old * (1 - gray)
-INNER_EDGE_MARK = 0.5
-FLAT_EDGE_MARK = 0.25
 FLAT_EDGE_PX = 2
 
 # mask alignment: a reference mask is built from another card's scan and
@@ -106,7 +106,8 @@ ALIGN_MAX_SHIFT = 3       # max shift in each direction, px
 ALIGN_MAX_GROW = 2        # max grow (+) / shrink (-), px
 ALIGN_BORDER_WEIGHT = 10  # weight of uncovered border pixels in the cost
 ALIGN_MIN_COVER = 0.6     # min fraction of the original mask size to keep
-ALIGNEMENT_THRESHOLD = 8
+ALIGN_THRESHOLD = 8       # max per-channel distance from the border color for
+                          # a pixel to count as border during alignment
 
 # mask cache next to the script; when the script itself lives in a read-only
 # location (e.g. the nix store via `nix run`), fall back to ./ref_masks
@@ -160,7 +161,28 @@ def effect_bucket(effect, warn=True):
 
 def frame_era(frame):
     """Scryfall frame era - only 1993 / 1997 / 2003 / 2015 / future exist."""
-    return str(frame or "") or "2015"
+    return str(frame or "2015")
+
+
+def has_crown(card, face=None):
+    """Whether the card face carries the legendary crown: Scryfall's frame
+    effect "legendary", or - for printings without the frame_effects backfill -
+    a legendary non-planeswalker on a 2015/future frame released from Dominaria
+    (CROWN_DATE) on. Planeswalkers never carry the crown. The crown is the only
+    legendary trait that changes the frame; without it, legendary and
+    non-legendary cards share the same border ring."""
+    face = face or {}
+    tl = (face.get("type_line") or card.get("type_line") or "").lower()
+    face_effects = face.get("frame_effects") if face is not card else None
+    if face_effects is not None:
+        effects = {str(e).lower() for e in face_effects}
+    else:
+        effects = {str(e).lower() for e in (card.get("frame_effects") or [])}
+    if "legendary" in effects:
+        return True
+    return bool("legendary" in tl and "planeswalker" not in tl
+                and frame_era(card.get("frame", "")) in ("2015", "future")
+                and (card.get("released_at") or "") >= CROWN_DATE)
 
 
 def stamp_of(card, face=None):
@@ -268,21 +290,31 @@ def scryfall_api_url(link):
     raise SystemExit(f"error: not a Scryfall card link: {link}")
 
 
+# injected into every /cards/search query: paper printings only ((game:paper) -
+# digital cards have different images), black-bordered default printings, no
+# promos, and neither Alpha nor Beta (lea/leb - their scans are off)
+COMMON_QUERY_TOKENS = ("(game:paper)", "border:black", "-is:promo", "is:default",
+                       "-set:lea", "-set:leb")
+
+
 def add_common_filters(uri):
-    """Add (game:paper) to the q parameter of a Scryfall /cards/search URI
-    (other URIs are returned unchanged)."""
+    """Add the COMMON_QUERY_TOKENS to the q parameter of a Scryfall
+    /cards/search URI (other URIs are returned unchanged); a token already
+    present in either polarity is not added again."""
     u = urllib.parse.urlsplit(uri)
     if not u.path.endswith("/cards/search"):
         return uri
     params = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
     for i, (k, v) in enumerate(params):
-        if k == "q" and "(game:paper)" not in v.split() and "-(game:paper)" not in v.split():
-            params[i] = (k, "(game:paper) " + v)
-            break
-    for i, (k, v) in enumerate(params):
-        if k == "q" and "border:black" not in v.split() and "-border:black" not in v.split():
-            params[i] = (k, "border:black " + v)
-            break
+        if k != "q":
+            continue
+        tokens = v.split()
+        missing = [t for t in COMMON_QUERY_TOKENS
+                   if t.lstrip("-") not in tokens
+                   and "-" + t.lstrip("-") not in tokens]
+        if missing:
+            params[i] = (k, " ".join(missing + tokens))
+        break
     return urllib.parse.urlunsplit(
         (u.scheme, u.netloc, u.path, urllib.parse.urlencode(params), u.fragment))
 
@@ -579,8 +611,8 @@ def inner_lines(region, card, n):
 
 def float_mask_from_region(region, card):
     """Grayscale float mask from a card-clipped border region: 1.0 inside
-    (fully negated), the innermost line INNER_EDGE_MARK (a 50/50 blend), the
-    next FLAT_EDGE_PX lines out FLAT_EDGE_MARK (the flat lines), 0 outside.
+    (fully negated), 0 outside; the innermost FLAT_EDGE_PX+1 lines get the
+    gray gradient (i+1)/(FLAT_EDGE_PX+1) from inside out (the blend band).
     The gray values are read from the mask at apply time and used as blend
     weights, so masks with varying grays in the band work the same way."""
     m = np.zeros(region.shape, np.float32)
@@ -592,8 +624,8 @@ def float_mask_from_region(region, card):
 
 def mask_from_region(region, card):
     """Grayscale float mask from a binary border region: the region is grown by
-    one pixel into the card interior first, so the flat/blend inner edge is
-    not part of the border itself."""
+    one pixel into the card interior first, so the blend band at the inner
+    edge is not part of the border itself."""
     return float_mask_from_region(dilate8(region) & card, card)
 
 
@@ -608,7 +640,7 @@ def resize_mask(mask, h, w):
 
 # ------------------------------------------------------- mask alignment
 
-def align_mask(mask, img, border, threshold=8):
+def align_mask(mask, img, border, threshold=ALIGN_THRESHOLD):
     """Nudge a reference mask (shift / grow / shrink) to fit the card image.
 
     Scryfall scans of the same layout differ by a few pixels, so the mask
@@ -652,8 +684,8 @@ def align_mask(mask, img, border, threshold=8):
         grow_order += [k, -k]
     grows = {}
     excls = {}    # innermost FLAT_EDGE_PX+1 lines of each grown region - they
-    # are not fully negated (the 50/50 blend line and the flat lines), so they
-    # must not count as covered non-black
+    # are not fully negated (the blend band), so they must not count as
+    # covered non-black
     for g in grow_order:
         if g == 0:
             r = region
@@ -689,6 +721,12 @@ def align_mask(mask, img, border, threshold=8):
 
 # ------------------------------------------------------- reference cards
 
+# Everything needed to find / identify the white reference of one card face
+RefSpec = namedtuple("RefSpec", ["key", "base", "layout", "era", "effects",
+                                 "buckets", "typecat", "crowned", "stamp",
+                                 "is_back", "pw_back"])
+
+
 def ref_key(card, face):
     """Cache key + search ingredients for the white reference of a card face.
 
@@ -703,13 +741,22 @@ def ref_key(card, face):
     meld card - the front carries the meld mark and is a normal card), or
     "default" for normal and the same-as-normal layouts - e.g. leveler exists
     both as 2003_leveler and 2015_leveler;
-    variant: legendary (crowned, plus creature/non-creature) when legendary;
-    for the default base also creature/other when not legendary - but only
-    in the 2015 frame, where creature and non-creature default frames differ
-    (power/toughness box); the other frames share one border ring;
+    variant: legendary_<creature|other>_crowned when the face carries the
+    legendary crown - the only legendary trait that changes the frame (without
+    the crown, legendary and non-legendary cards share the same border ring,
+    and planeswalkers never carry a crown); for the default and modal bases
+    also creature/other - but only in the 2015 frame, where creature and
+    non-creature frames differ (power/toughness box; modal cards can be
+    creatures on either face, and vehicles count as creatures); the other
+    frames share one border ring;
     extras: one per relevant frame-effect bucket (dfc, fandfc, unknown) plus
     the holostamp (stamp, or stamp_<value>, e.g. stamp_triangle for the
-    Universes Beyond stamp).
+    Universes Beyond stamp), plus pw_back for the back side of a transform
+    card that is a planeswalker on both sides - a unique frame no other card
+    has.
+    A transform front always carries a DFC mark, so when Scryfall does not
+    report the frame effect the dfc bucket is assumed (battles are exempt -
+    their transform layout carries no DFC mark).
     Each face of a two-faced card gets the characteristics of its own face:
     the face's frame_effects are used when Scryfall provides them (otherwise
     the card-level ones), and the type line is face-first - so e.g. the
@@ -760,68 +807,94 @@ def ref_key(card, face):
         # the back side of a meld card (letter-suffixed collector number, e.g.
         # emn/15b) is its own layout; the front is a normal card
         base = "meld"
+    elif layout not in LAYOUT_SAME_AS_NORMAL and layout != "normal":
+        print("warning: unsupported layout")
+        base = "default"
     else:
-        # normal and LAYOUT_SAME_AS_NORMAL share the frame-era border
+        # normal cards and the same-as-normal layouts (flip, adventure,
+        # prepare, mutate, prototype, host, meld front) share the frame-era
+        # border; transform/meld marks come from the frame effects (dfc
+        # bucket)
         base = "default"
     # a back side never has a holostamp and never the DFC mark: the second
     # face of a transform/modal_dfc card, or the back of a meld card
     faces = card.get("card_faces") or []
     is_back = base == "meld" or (bool(faces) and face is not faces[0])
-    legendary = "legendary" in effects or "legendary" in tl
-    # the legendary crown (frame effect "legendary") was introduced with
-    # Dominaria (CROWN_DATE) and only exists on 2015/future-frame legendary
-    # non-planeswalkers; printings without the frame_effects backfill are
-    # placed by release date
-    crowned = ("legendary" in effects or (
-        legendary and "planeswalker" not in tl
-        and frame_era(card.get("frame", "")) in ("2015", "future")
-        and (card.get("released_at") or "") >= CROWN_DATE))
-    # card type matters for the frame: legendary creature and non-creature
-    # frames differ (power/toughness box), planeswalkers have their own frame
+    # the back side of a transform card that is a planeswalker on both sides
+    # has a unique frame no other card has
+    pw_back = (is_back and layout == "transform" and len(faces) > 1
+               and all("planeswalker" in (f.get("type_line") or "").lower()
+                       for f in faces))
+    crowned = has_crown(card, face)
+    # card type matters for the frame: creature and non-creature frames
+    # differ (power/toughness box), planeswalkers have their own frame.
+    # Vehicles (Artifact — Vehicle) count as creatures: they carry the
+    # power/toughness box, so their frame is the creature frame
     if "planeswalker" in tl:
         typecat = "planeswalker"
-    elif "creature" in tl:
+    elif "creature" in tl or "vehicle" in tl:
         typecat = "creature"
     else:
         typecat = "other"
-    if legendary:
-        variant = "legendary" if typecat == "planeswalker" else f"legendary_{typecat}"
-        if crowned and typecat != "planeswalker":
-            variant += "_crowned"
-    elif base == "default" and era == "2015":
+    if crowned and typecat != "planeswalker":
+        variant = f"legendary_{typecat}_crowned"
+    elif base in ("default", "modal") and era == "2015":
         # only the 2015 frame differentiates creature and non-creature
-        # default frames (power/toughness box), legendary or not - the
+        # default/modal frames (power/toughness box) - the
         # 1993/1997/2003/future frames share one border ring
         variant = typecat
     else:
         variant = "default"
-    # frame-effect buckets ("legendary" is carried by the variant, "spree" by
-    # the base) plus the holostamp, all as "+" extras of the key
+    # frame-effect buckets ("legendary" is carried by the crowned variant,
+    # "spree" by the base) plus the holostamp, all as "+" extras of the key
     buckets = sorted({b for b in (effect_bucket(e) for e in effects) if b})
     if is_back:
+        # a back side never carries the DFC mark
         buckets = [b for b in buckets if b not in ("dfc", "fandfc")]
+    elif (layout == "transform" and base != "battle"
+          and not {"dfc", "fandfc"} & set(buckets)):
+        # a transform front always carries a DFC mark - when Scryfall does
+        # not report the frame effect, the dfc bucket is assumed (fandfc is
+        # its own mark and counts as one). Battles are exempt: their
+        # transform layout carries no DFC mark
+        buckets = sorted(set(buckets) | {"dfc"})
     stamp = None if is_back else stamp_of(card, face)
     extras = {b for b in buckets if b not in ("legendary", "spree")}
     if stamp:
         extras.add(stamp_key(stamp))
+    if pw_back:
+        extras.add("pw_back")
     key = f"{era}_{base}" + (f"_{variant}" if variant != "default" else "")
     if extras:
         key += "+" + "+".join(sorted(extras))
-    return key, base, layout, era, legendary, effects, buckets, typecat, crowned, stamp
+    return RefSpec(key, base, layout, era, effects, buckets, typecat,
+                   crowned, stamp, is_back, pw_back)
 
 
-def ref_search_query(base, layout, era, legendary, buckets, typecat,
-                     crowned=False, stamp=None):
+def ref_search_query(base, layout, era, buckets, typecat,
+                     crowned=False, stamp=None, pw_back=False, back=False):
     """Scryfall query for a white card with the same frame characteristics.
 
     Frame era, layout, the legendary crown (frame effect "legendary", Dominaria
-    2018-04-27 onward), the card type (creature / non-creature - for the default
-    base in the 2015 frame only, legendary or not), the frame-effect buckets and the
+    2018-04-27 onward - the only legendary trait that changes the frame), the
+    card type (creature / non-creature - for the default and modal bases in
+    the 2015 frame only, or when crowned; not queried for a back side, see
+    back=), the frame-effect buckets and the
     holostamp (stamp: raw security_stamp of the asked card, None = no stamp,
     aliased via stamp_key so e.g. "acorn" queries as the oval stamp) are
-    matched with layout: / frame: / date / kw: / t: / r: / is: qualifiers.
+    matched with layout: / frame: / kw: / t: / r: / is: qualifiers - and every
+    characteristic the asked card does NOT have is negated as well
+    (-frame:..., -layout:..., -kw:..., -t:...), so results only contain cards
+    with exactly the same frame. pw_back queries the unique back frame of
+    transform cards that are planeswalkers on both sides.
     Alpha (lea) is always excluded - Beta (leb) is taken instead."""
-    if base.startswith("split_"):
+    want = set(buckets or ()) - {"legendary", "spree"}
+    if pw_back:
+        # the unique back frame of transform cards that are planeswalkers on
+        # both sides: only another such card has it (on its back side)
+        parts = ["layout:transform", "t:planeswalker", "t:legendary",
+                 f"frame:{era}"]
+    elif base.startswith("split_"):
         parts = ["layout:split", f"frame:{era}"]
         sub = base.split("_", 1)[1]
         if sub != "regular":
@@ -851,33 +924,53 @@ def ref_search_query(base, layout, era, legendary, buckets, typecat,
     # the holostamp is part of the mask, so the reference must carry the same
     # stamp: the regular oval stamp (r>=rare, not Universes Beyond) or a
     # Universes Beyond stamp such as the triangle (is:universesbeyond). For
-    # no stamp no query clause is needed - the client-side security_stamp
-    # check in find_white_reference drops stamped candidates (frames older
-    # than 2015 never had stamps, and there the check passes trivially)
+    # no stamp no query clause is needed - the client-side key comparison in
+    # find_white_reference drops wrongly-stamped candidates (frames older
+    # than 2015 never had stamps, and there the key comparison passes
+    # trivially)
     if stamp_key(stamp) == "stamp":
         parts.extend(["r>=rare", "-is:universesbeyond"])
     elif stamp:
         parts.extend(["r>=rare", "is:universesbeyond"])
-    if legendary:
-        # t:legendary, not is:legendary - the latter matches non-legendary cards
+    if crowned:
+        # the legendary crown (frame effect "legendary", Dominaria 2018+);
+        # t:legendary, not is:legendary - the latter matches non-legendary
+        # cards
         parts.append("t:legendary")
-        if crowned:
-            # the legendary crown: frame effect "legendary" (Dominaria 2018+)
-            parts.append("frame:legendary")
-        elif era in ("2015", "future"):
-            # crownless 2015-frame printings all predate Dominaria
-            parts.append(f"date<{CROWN_DATE}")
-    if legendary or (base == "default" and era == "2015"):
+        parts.append("frame:legendary")
+    elif not pw_back:
+        # no crown on the asked card: crowned legendaries (frame:legendary)
+        # are excluded. Without the crown legendary does not change the
+        # frame, so no positive legendary clause is needed either
+        parts.append("-frame:legendary")
+    if not back and (crowned or (base in ("default", "modal") and era == "2015")):
         # creature and non-creature frames differ (power/toughness box) only
-        # in the 2015 frame, legendary or not; the other frames share one
-        # border ring
+        # in the 2015 frame (default and modal bases), or when crowned; the
+        # other frames share one border ring. Skipped for a back side: card
+        # level type qualifiers match any face, so they would exclude
+        # candidates whose back face has the wanted type - the client-side
+        # key comparison on the back face filters those instead
         if typecat == "creature":
             parts.append("t:creature")
         elif typecat == "other":
             parts.extend(["-t:creature", "-t:planeswalker"])
-    # one search term per frame-effect bucket (dfc = any DFC mark)
-    for b in sorted(set(buckets) - {"legendary", "spree"}):
+    # one search term per frame-effect bucket present on the card (dfc = any
+    # DFC mark), and a negation per known bucket it does not have
+    for b in sorted(want):
         parts.append(BUCKET_QUERY.get(b, f"frame:{b}"))
+    if not pw_back and base != "battle":
+        # battles are transform-layout without a DFC mark (their own base)
+        if "dfc" not in want:
+            parts.extend(f"-frame:{e}" for e in sorted(DFC_EFFECTS))
+        if "fandfc" not in want:
+            parts.append("-frame:fandfc")
+        if "dfc" not in want and "fandfc" not in want:
+            # no DFC mark on the asked card: plain cards only
+            parts.append("-layout:transform")
+    if base != "modal":
+        parts.append("-layout:modal_dfc")
+    if base != "spree":
+        parts.append("-kw:spree")
     return " ".join(parts)
 
 
@@ -894,24 +987,49 @@ def card_png(c):
     return png
 
 
-def find_white_reference(query, legendary=False, typecat=None, era=None,
-                         crowned=False, buckets=None, stamp=None, meld_back=False):
+def candidate_key(c, back=False):
+    """Reference key of a search-result card, computed on its front face - or
+    on its back face when back=True. For a back-side comparison the stamp and
+    DFC-mark extras are stripped (back sides never carry them), so a plain
+    card can match a back face of the same frame."""
+    faces = c.get("card_faces") or []
+    face = faces[-1] if (back and len(faces) > 1) else (faces[0] if faces else c)
+    key = ref_key(c, face).key
+    if back:
+        head, _, extras = key.partition("+")
+        keep = [e for e in extras.split("+")
+                if e and not e.startswith("stamp") and e not in ("dfc", "fandfc")]
+        key = head + ("+" + "+".join(keep) if keep else "")
+    return key
+
+
+def reference_png(ref, back=False):
+    """PNG image URI of the reference card: its back face for a back-side mask
+    (only multi-faced references carry one), else the usual first image."""
+    faces = ref.get("card_faces") or []
+    if back and len(faces) > 1:
+        png = (faces[-1].get("image_uris") or {}).get("png")
+        if png:
+            return png
+    return card_png(ref)
+
+
+def find_white_reference(query, key=None, back=False):
     """The one useful mono-white printing for the query, or None: only the first
-    page of search results is fetched, then the blandest (plain border, no
-    promo/full-art/showcase/...), oldest one is picked. When legendary is set,
-    non-legendary results are dropped client-side (Scryfall's is:legendary is
-    unreliable, hence t:legendary in the query plus this check); typecat
-    ('creature' / 'planeswalker' / 'other'), frame era, crown era (the
-    frame:legendary effect, Dominaria 2018-04-27 onward), the frame-effect
-    buckets and the holostamp (stamp: raw security_stamp, checked client-side
-    because it is not a search qualifier) are checked the same way, so e.g. a
-    crownless, DFC-less or wrongly-stamped reference is never used for a
-    crowned / transforming / stamped card. When no mono-white candidate exists,
-    the first candidate with white in one of its faces and black in none of
-    them is used instead (a black-containing face means a black frame, where
-    the border is not distinct). A foil-only printing and an Alpha (lea)
-    printing are never selected when another candidate exists; the stamp is
-    compared via stamp_key, so aliased stamps (e.g. acorn = oval) match."""
+    page of search results is fetched. When key is given, a candidate is kept
+    only if its own reference key equals it - every aspect of the card must
+    match in both directions: a characteristic the asked card has (frame era,
+    layout/base, legendary crown, card type, frame-effect buckets, holostamp,
+    meld back, ...) is required of the candidate, and one it does not have
+    excludes the candidate (no crown for a crownless card, no DFC mark for a
+    non-transform card, no stamp for an unstamped one, ...). With back=True
+    the candidate's back face is compared. Among the matches the blandest
+    (plain border, no promo/full-art/showcase/...), oldest one is picked. When
+    no mono-white candidate exists, the first candidate with white in one of
+    its faces and black in none of them is used instead (a black-containing
+    face means a black frame, where the border is not distinct). A foil-only
+    printing and an Alpha (lea) printing are never selected when another
+    candidate exists."""
     results = search_cards(query, paginate=False)
     # white in the card's colors or in one of its faces, and a png somewhere
     # (two-faced cards can have a null card-level colors and no card-level
@@ -929,36 +1047,9 @@ def find_white_reference(query, legendary=False, typecat=None, era=None,
     non_lea = [c for c in cands if (c.get("set") or "").lower() != "lea"]
     if non_lea:
         cands = non_lea
-    if meld_back:
-        # only other meld backs (letter-suffixed collector numbers) match
-        cands = [c for c in cands
-                 if re.search(r"[a-z]$", str(c.get("collector_number") or ""))]
-    if era:
-        cands = [c for c in cands if str(c.get("frame")) == str(era)]
-    cands = [c for c in cands if stamp_key(stamp_of(c)) == stamp_key(stamp)]
-    if legendary:
-        cands = [c for c in cands if "legendary" in (c.get("type_line") or "").lower()]
-        if crowned:
-            cands = [c for c in cands
-                     if "legendary" in {str(e).lower()
-                                        for e in (c.get("frame_effects") or [])}
-                     or (c.get("released_at") or "") >= CROWN_DATE]
-        elif era in ("2015", "future"):
-            cands = [c for c in cands if (c.get("released_at") or "") < CROWN_DATE]
-    want = set(buckets or ()) - {"legendary", "spree"}
-    if buckets is not None:
-        cands = [c for c in cands
-                 if {b for b in (effect_bucket(e, warn=False)
-                                 for e in (c.get("frame_effects") or [])) if b}
-                 - {"legendary", "spree"} == want]
-    if typecat == "creature":
-        cands = [c for c in cands if "creature" in (c.get("type_line") or "").lower()]
-    elif typecat == "planeswalker":
-        cands = [c for c in cands if "planeswalker" in (c.get("type_line") or "").lower()]
-    elif typecat == "other":
-        cands = [c for c in cands
-                 if "creature" not in (c.get("type_line") or "").lower()
-                 and "planeswalker" not in (c.get("type_line") or "").lower()]
+    if key is not None:
+        # exact match on every aspect of the card, in both directions
+        cands = [c for c in cands if candidate_key(c, back) == key]
     mono = [c for c in cands if c.get("colors") == ["W"]]
     if not mono:
         # fallback: the first candidate with white in one of its faces and
@@ -985,19 +1076,18 @@ def reference_mask(key, card, face, ref_dir, args):
         m = np.asarray(Image.open(path).convert("L"), dtype=np.float32) / 255.0
         return m, f"cached {path}"
 
-    (_, base, layout, era, legendary, _effects, buckets, typecat, crowned,
-     stamp) = ref_key(card, face)
-    query = ref_search_query(base, layout, era, legendary, buckets, typecat,
-                             crowned=crowned, stamp=stamp)
-    ref = find_white_reference(query, legendary=legendary, typecat=typecat,
-                               era=era, crowned=crowned, buckets=buckets,
-                               stamp=stamp, meld_back=(base == "meld"))
+    spec = ref_key(card, face)
+    query = ref_search_query(spec.base, spec.layout, spec.era, spec.buckets,
+                             spec.typecat, crowned=spec.crowned,
+                             stamp=spec.stamp, pw_back=spec.pw_back,
+                             back=spec.is_back)
+    ref = find_white_reference(query, key=key, back=spec.is_back)
     if ref is None:
         return None, None
     print(f"  generating new mask '{key}' from white reference "
           f"'{ref.get('name')}' ({ref.get('set')}/{ref.get('collector_number')}, "
           f"stamp {ref.get('security_stamp') or 'none'})")
-    png = card_png(ref)
+    png = reference_png(ref, back=spec.is_back)
     img = Image.open(io.BytesIO(http_get(png)))
     region, _border, border_hex = detect_region(
         img, threshold=args.threshold, max_hole=args.max_hole)
@@ -1019,9 +1109,9 @@ def apply_mask(img, mask, border=None, scale=1.0, mpc=False):
 
     mask 1 (resized to the card, NEAREST so the mask levels survive) -> pixel
     inverted (255 - pixel); 0 -> untouched. The inner edge pixels
-    (0 < mask < 1: the innermost blend/flat lines of the mask band) blend the
-    NEW border color of the card into the pixel, each with its own mask gray
-    value read from the mask as the blend weight:
+    (0 < mask < 1: the blend band lines of the mask) blend the NEW border
+    color of the card into the pixel, each with its own mask gray value read
+    from the mask as the blend weight:
         new = new_border * gray + old * (1 - gray)
     where new_border = 255 - border (border: the detected border color of this
     card, so light / white-ish). Without a border color the inner edge pixels
@@ -1078,7 +1168,7 @@ def process_image(img, args, card=None, face=None):
             print(f"  warning: layout '{layout}' is not supported "
                   f"- leaving the card unchanged")
             return img.convert("RGBA"), stats
-        key = ref_key(card, face or card)[0]
+        key = ref_key(card, face or card).key
         mask, src = reference_mask(key, card, face or card, Path(args.ref_dir), args)
         if mask is None:
             print(f"  warning: no white reference card found for '{key}' "
@@ -1088,7 +1178,7 @@ def process_image(img, args, card=None, face=None):
             # one (self-detected masks are skipped - they already fit)
             cmask = card_mask(img)
             mask = resize_mask(mask, cmask.shape[0], cmask.shape[1])
-            mask, info = align_mask(mask, img, border, threshold=ALIGNEMENT_THRESHOLD)
+            mask, info = align_mask(mask, img, border)
             if info is None:
                 # no adjustment: re-derive the mask levels so old cache
                 # entries (without the inner edge band) get them too
