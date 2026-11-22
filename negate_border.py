@@ -58,9 +58,11 @@ Default outputs: <name>_negated.<ext> next to the input file, <dir>-negated/
 for a directory, <card>_negated.png for a URL (or <card>_faceN_negated.png per
 face for transform / modal_dfc cards - second faces are only processed for
 those layouts). Each face of a two-faced card gets the reference mask of its
-own characteristics (e.g. a planeswalker back side gets the planeswalker
-mask, a modal_dfc planeswalker the modal_planeswalker one); a back side never
-carries a holostamp or the DFC mark.
+own characteristics (e.g. a planeswalker back side gets the planeswalker_back
+mask, a modal_dfc planeswalker the modal_planeswalker_back one); a back side
+never carries a holostamp or the DFC mark. Planeswalker (and spacecraft) faces
+further intersect the calculated mask with the one autodetected on the card
+itself.
 
 Requires pillow + numpy (provided by the flake devShell:
 nix develop --command python3 negate_border.py IMAGE)
@@ -771,7 +773,9 @@ def ref_key(card, face):
     border ring, not an exclusive choice - it always starts with the frame
     era (the "date"):
         <era>_<base>[_<variant>][+<extras>]
-    base: leb, spree, planeswalker, room (Enchantment — Room, split layout),
+    base: leb, spree, planeswalker (planeswalker_back on a back side - a
+    planeswalker back side has its own frame, different from a front), room
+    (Enchantment — Room, split layout),
     battle (Battle — ..., detected from the type line since layout:battle is
     not a Scryfall qualifier), split_<fuse|aftermath|regular>, saga (also
     class/case), modal (modal_dfc - not exclusive with the other bases: a
@@ -793,8 +797,8 @@ def ref_key(card, face):
     extras: one per relevant frame-effect bucket (dfc, fandfc, unknown) plus
     the holostamp (stamp, or stamp_<value>, e.g. stamp_triangle for the
     Universes Beyond stamp), plus pw_back for the back side of a transform
-    card that is a planeswalker on both sides - a unique frame no other card
-    has.
+    card that is a planeswalker on both sides - a unique frame (stacked on
+    planeswalker_back) no other card has.
     A transform front always carries a DFC mark, so when Scryfall does not
     report the frame effect the dfc bucket is assumed (battles are exempt -
     their transform layout carries no DFC mark). A meld front carries the
@@ -874,6 +878,10 @@ def ref_key(card, face):
     # face of a transform/modal_dfc card, or the back of a meld card
     faces = card.get("card_faces") or []
     is_back = base == "meld" or (bool(faces) and face is not faces[0])
+    if is_back and base.endswith("planeswalker"):
+        # a planeswalker back side has a frame of its own, different from a
+        # planeswalker front (modal_planeswalker_back for a modal_dfc face)
+        base = base + "_back"
     # the back side of a transform card that is a planeswalker on both sides
     # has a unique frame no other card has
     pw_back = (is_back and layout == "transform" and len(faces) > 1
@@ -962,6 +970,10 @@ def ref_search_query(base, layout, era, buckets, typecat,
     # query the X base and require the modal layout on top of it
     modal = base.startswith("modal_")
     sub_base = base.split("_", 1)[1] if modal else base
+    if sub_base.endswith("_back"):
+        # a planeswalker back side (planeswalker_back / modal_planeswalker_back):
+        # queried like a planeswalker front, the back= flag selects the backs
+        sub_base = sub_base[:-len("_back")]
     if (layout == "modal_dfc" and "dfc" in want
             and (released_at or "") >= SPIDERMAN_DATE):
         # the dfc mark of a Spider-Man-era modal_dfc front is not a reported
@@ -1040,8 +1052,11 @@ def ref_search_query(base, layout, era, buckets, typecat,
     # DFC mark), and a negation per known bucket it does not have
     for b in sorted(want):
         parts.append(BUCKET_QUERY.get(b, f"frame:{b}"))
-    if not pw_back and base != "battle":
-        # battles are transform-layout without a DFC mark (their own base)
+    if not pw_back and base != "battle" and not back:
+        # battles are transform-layout without a DFC mark (their own base).
+        # Skipped for a back side: a back never carries a DFC mark either, so
+        # DFC-marked / transform-layout candidates are allowed - their back
+        # face is what gets compared client-side
         if "dfc" not in want:
             parts.extend(f"-frame:{e}" for e in sorted(DFC_EFFECTS))
         if "fandfc" not in want:
@@ -1241,10 +1256,10 @@ def process_image(img, args, card=None, face=None):
     white reference for the card's characteristics; otherwise (or when no
     reference exists) it is detected on the image itself - and, when a key is
     known, cached under that key so later runs load it instead of
-    re-detecting. Spacecraft (Artifact — Spacecraft) have a frame that differs
-    inside the border ring: their mask is the intersection of the reference
-    mask a non-spacecraft card would use and the mask autodetected on the card
-    itself."""
+    re-detecting. Spacecraft (Artifact — Spacecraft) and planeswalkers have a
+    frame that differs inside the border ring: their mask is the intersection
+    of the calculated reference mask (the one a plain card of the same
+    characteristics would use) and the mask autodetected on the card itself."""
     region, border, border_hex = detect_region(
         img, threshold=args.threshold, max_hole=args.max_hole)
     stats = {"found": False, "frac": 0.0, "border": border_hex, "mask": "none"}
@@ -1253,6 +1268,7 @@ def process_image(img, args, card=None, face=None):
     src = None
     key = None
     spacecraft = False
+    planeswalker = False
     if card is not None:
         layout = (card.get("layout") or "").lower()
         if layout in LAYOUT_UNSUPPORTED:
@@ -1262,6 +1278,7 @@ def process_image(img, args, card=None, face=None):
         f = face or card
         tl = (f.get("type_line") or card.get("type_line") or "").lower()
         spacecraft = "spacecraft" in tl
+        planeswalker = "planeswalker" in tl
         key = ref_key(card, f).key
         mask, src = reference_mask(key, card, f, Path(args.ref_dir), args)
         if mask is None:
@@ -1272,19 +1289,21 @@ def process_image(img, args, card=None, face=None):
             # one (self-detected masks are skipped - they already fit)
             cmask = card_mask(img)
             mask = resize_mask(mask, cmask.shape[0], cmask.shape[1])
-            if spacecraft and region is not None and region.any():
-                # spacecraft frames differ inside the border ring: intersect
-                # the reference mask (the one a non-spacecraft card of the
+            if (spacecraft or planeswalker) and region is not None and region.any():
+                # spacecraft and planeswalker frames differ inside the border
+                # ring (a planeswalker back side even more so than a front):
+                # intersect the calculated mask (the one a plain card of the
                 # same characteristics would use) with the autodetected mask
+                why = "spacecraft" if spacecraft else "planeswalker"
                 inter = (mask > 0) & region
                 if inter.any():
                     mask = inter.astype(np.float32)
-                    src = f"{src} (intersected with the autodetected mask: spacecraft)"
+                    src = f"{src} (intersected with the autodetected mask: {why})"
                 else:
                     print("  warning: empty intersection with the autodetected "
                           "mask - using the autodetected mask alone")
                     mask = region.astype(np.float32)
-                    src = f"{src} (autodetected only: spacecraft)"
+                    src = f"{src} (autodetected only: {why})"
             # the blend band is derived at apply time (apply_mask), masks
             # stay binary here
             mask, info = align_mask(mask, img, border)
