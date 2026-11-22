@@ -52,8 +52,6 @@ Usage:
     negate_border.py DIR [-o OUTDIR] [flags]
 
 Detection flags: --threshold / --max-hole.
-Output flags: --scale F, --mpc (MPC Autofill format:
-63x88 mm card at 800 DPI = 1984x2772 px).
 
 Default outputs: <name>_negated.<ext> next to the input file, <dir>-negated/
 for a directory, <card>_negated.png for a URL (or <card>_faceN_negated.png per
@@ -263,14 +261,6 @@ LAYOUT_UNSUPPORTED = {"scheme", "vanguard", "augment", "art_series", "planar",
 SPECIAL_PRINTING_EFFECTS = {"showcase", "extendedart", "borderless", "etched",
                             "inverted", "fullart", "textless"}
 
-# MakePlayingCards (MPC Autofill target): card face is 63x88 mm and the digital
-# press prints at max 800 DPI, so the ideal upload is 63/25.4*800 x 88/25.4*800
-MPC_CARD_MM = (63.0, 88.0)
-MPC_MAX_DPI = 800
-MPC_SIZE = (round(MPC_CARD_MM[0] / 25.4 * MPC_MAX_DPI),
-            round(MPC_CARD_MM[1] / 25.4 * MPC_MAX_DPI))  # (1984, 2772)
-
-
 # ---------------------------------------------------------------- HTTP / API
 
 def http_get(url, timeout=60, retries=3):
@@ -319,7 +309,10 @@ def scryfall_api_url(link):
 
 # injected into every /cards/search query: paper printings only ((game:paper) -
 # digital cards have different images), black-bordered default printings, no
-# promos, and neither Alpha nor Beta (lea/leb - their scans are off)
+# promos, and none of the sets whose scans are off (Alpha/Beta lea/leb, plus
+# fbb/cei/ced/4bb). This is the ONE place those sets are excluded from a
+# search - alpha_unlimited_printing() opts out (common=False) because it has
+# to see Alpha to detect Alpha-oldest cards.
 COMMON_QUERY_TOKENS = ("(game:paper)", "border:black", "-is:promo", "is:default",
                        "-set:lea", "-set:leb", "-set:fbb", "-set:cei", "-set:ced", "-set:4bb")
 
@@ -404,59 +397,84 @@ def blandness(c):
     return score
 
 
-def oldest_printing(card):
-    """Oldest printing of the card; Alpha (lea) is never chosen - when the
-    oldest printing would be Alpha, the next-oldest set is taken instead
-    (Beta, leb, for Alpha cards) - and a foil-only printing is never chosen
-    when a non-foil one exists.
+def printing_order(c):
+    """Sort key of a printing: oldest first, then set, then the blandest one
+    (plain border, no promo/full-art/showcase/etc.), then collector number."""
+    return (c.get("released_at") or "", (c.get("set") or "").lower(),
+            blandness(c), str(c.get("collector_number") or ""))
 
-    When that oldest set has several printings of the card, the blandest one
-    (plain border, no promo/full-art/showcase/etc.) wins over the collector
-    number order."""
+
+def prefer_nonfoil(cards):
+    """Drop foil-only printings when a non-foil one exists."""
+    nonfoil = [c for c in cards if not (c.get("foil") and not c.get("nonfoil"))]
+    return nonfoil or cards
+
+
+def prints_uri(card):
+    """Scryfall search URI for every printing of a card."""
     uri = card.get("prints_search_uri")
     if not uri and card.get("oracle_id"):
         uri = ("https://api.scryfall.com/cards/search?q=oracle_id:"
                + urllib.parse.quote(card["oracle_id"]) + "&unique=prints")
+    return uri
+
+
+def all_printings(card, common=True):
+    """Every printing of a card (same oracle id), sorted by printing_order;
+    a foil-only printing is never chosen when a non-foil one exists. With
+    common=False the COMMON_QUERY_TOKENS are not injected, so Alpha/Beta
+    printings are included - only alpha_unlimited_printing() needs that, to
+    detect Alpha-oldest cards; every other search goes through the global
+    filters."""
+    uri = prints_uri(card)
     if not uri:
-        return card
-    prints = [c for c in search_all(uri) if c.get("oracle_id") == card.get("oracle_id")]
-    if not prints:
-        return card
-    nonfoil = [c for c in prints if not (c.get("foil") and not c.get("nonfoil"))]
-    if nonfoil:
-        prints = nonfoil
-    non_lea = [c for c in prints if (c.get("set") or "").lower() != "lea"]
-    if non_lea:
-        prints = non_lea
-    prints.sort(key=lambda c: (c.get("released_at") or "", (c.get("set") or "").lower(),
-                               blandness(c), str(c.get("collector_number") or "")))
-    return prints[0]
+        return []
+    prints = [c for c in search_all(uri, common=common)
+              if c.get("oracle_id") == card.get("oracle_id")]
+    prints = prefer_nonfoil(prints)
+    prints.sort(key=printing_order)
+    return prints
+
+
+def oldest_printing(card):
+    """Oldest printing of the card, blandest first within the oldest set.
+    Alpha/Beta and the other off-scan sets are never returned - they are
+    already excluded by the COMMON_QUERY_TOKENS injected into every search."""
+    prints = all_printings(card)
+    return prints[0] if prints else card
 
 
 def alpha_unlimited_printing(card):
     """The Unlimited (2ed) printing of the card when its oldest printing is
     Alpha (lea), else None. Alpha scans are off, so such a card is not run
-    through the tool - the Unlimited printing is returned as-is."""
-    uri = card.get("prints_search_uri")
-    if not uri and card.get("oracle_id"):
-        uri = ("https://api.scryfall.com/cards/search?q=oracle_id:"
-               + urllib.parse.quote(card["oracle_id"]) + "&unique=prints")
-    if not uri:
-        return None
-    # all printings, Alpha included (no COMMON_QUERY_TOKENS injected)
-    prints = [c for c in search_all(uri, common=False)
-              if c.get("oracle_id") == card.get("oracle_id")]
-    nonfoil = [c for c in prints if not (c.get("foil") and not c.get("nonfoil"))]
-    if nonfoil:
-        prints = nonfoil
-    if not prints:
-        return None
-    key = lambda c: (c.get("released_at") or "", (c.get("set") or "").lower(),
-                     blandness(c), str(c.get("collector_number") or ""))
-    if (min(prints, key=key).get("set") or "").lower() != "lea":
+    through the tool - the Unlimited printing is returned as-is. This is the
+    only search that includes Alpha (common=False): it has to see lea to
+    detect it."""
+    prints = all_printings(card, common=False)
+    if not prints or (prints[0].get("set") or "").lower() != "lea":
         return None
     unl = [c for c in prints if (c.get("set") or "").lower() == "2ed"]
-    return min(unl, key=key) if unl else None
+    return min(unl, key=printing_order) if unl else None
+
+
+def card_by_name(name):
+    """Scryfall card object for a plain card name (deck lists): exact-name
+    search, then the oldest printing - the same resolution get_card() applies
+    to a link. An exact-name search also matches the face names of other
+    cards (e.g. "Lightning Bolt" matches "Emeritus of Conflict // Lightning
+    Bolt"), so printings whose own card name is exactly the asked name are
+    preferred. Falls back to Scryfall's fuzzy lookup (a deck list may carry
+    only one face's name of a double-faced card)."""
+    hits = search_cards(f'!"{name}"', paginate=False)
+    exact = [c for c in hits if (c.get("name") or "").lower() == name.lower()]
+    pool = exact or hits
+    if pool:
+        return oldest_printing(min(pool, key=printing_order))
+    uri = "https://api.scryfall.com/cards/named?" + urllib.parse.urlencode({"fuzzy": name})
+    data = json.loads(http_get(uri))
+    if data.get("object") == "error":
+        return None
+    return oldest_printing(data)
 
 
 def card_faces(card):
@@ -1143,8 +1161,9 @@ def find_white_reference(query, key=None, back=False):
     no mono-white candidate exists, the first candidate with white in one of
     its faces and black in none of them is used instead (a black-containing
     face means a black frame, where the border is not distinct). A foil-only
-    printing and an Alpha (lea) printing are never selected when another
-    candidate exists."""
+    printing is never selected when a non-foil one exists; Alpha/Beta and the
+    other off-scan sets never appear - they are already excluded by the
+    COMMON_QUERY_TOKENS injected into the search."""
     results = search_cards(query, paginate=False)
     # white in the card's colors or in one of its faces, and a png somewhere
     # (two-faced cards can have a null card-level colors and no card-level
@@ -1154,14 +1173,7 @@ def find_white_reference(query, key=None, back=False):
              and ("W" in (c.get("colors") or [])
                   or any("W" in (f.get("colors") or [])
                          for f in (c.get("card_faces") or [])))]
-    # a foil-only printing is never selected when a non-foil one exists
-    nonfoil = [c for c in cands if not (c.get("foil") and not c.get("nonfoil"))]
-    if nonfoil:
-        cands = nonfoil
-    # Alpha (lea) is never chosen - Beta (leb) or another set instead
-    non_lea = [c for c in cands if (c.get("set") or "").lower() != "lea"]
-    if non_lea:
-        cands = non_lea
+    cands = prefer_nonfoil(cands)
     if key is not None:
         # exact match on every aspect of the card, in both directions
         cands = [c for c in cands if candidate_key(c, back) == key]
@@ -1223,7 +1235,7 @@ def reference_mask(key, card, face, args):
 
 # ------------------------------------------------------------------ pipeline
 
-def apply_mask(img, mask, border=None, scale=1.0, mpc=False):
+def apply_mask(img, mask, border=None):
     """Negate the card inside the border mask.
 
     The mask is binary (1 inside the region, 0 outside; stored masks are
@@ -1261,11 +1273,6 @@ def apply_mask(img, mask, border=None, scale=1.0, mpc=False):
             neg * gray[:, None] + rgb[inner] * (1.0 - gray[:, None])
         ).astype(np.uint8)
     out = Image.fromarray(arr, "RGBA")
-    if mpc:
-        out = out.resize(MPC_SIZE, Image.LANCZOS)
-    elif scale != 1.0:
-        out = out.resize((max(1, round(out.width * scale)),
-                          max(1, round(out.height * scale))), Image.LANCZOS)
     frac = 100.0 * weight.sum() / max(1, cmask.sum())
     return out, weight.astype(np.float32), frac, inner
 
@@ -1354,8 +1361,7 @@ def process_image(img, args, card=None, face=None):
             print(f"  saved new mask to {path}")
             src = f"self-detected on '{card.get('name')}' -> {path}"
 
-    out, _weight, frac, inner = apply_mask(img, mask, border=border,
-                                           scale=args.scale, mpc=args.mpc)
+    out, _weight, frac, inner = apply_mask(img, mask, border=border)
     stats.update(found=True, frac=frac, mask=src, inner=int(inner.sum()))
     return out, stats
 
@@ -1382,30 +1388,13 @@ def process_dir(src, args):
         process_file(f, out_dir / f.name, args)
 
 
-def process_url(link, args):
-    card = get_card(link)
-    unl = alpha_unlimited_printing(card)
-    if unl is not None:
-        # the oldest printing is Alpha: return the Unlimited printing as-is,
-        # without going through the tool
-        png = card_png(unl)
-        if png:
-            print(f"  oldest printing of '{card.get('name')}' is Alpha (lea) - "
-                  f"returning the Unlimited printing ({unl.get('set_name')} "
-                  f"#{unl.get('collector_number')}) as-is, not negated")
-            img = Image.open(io.BytesIO(http_get(png)))
-            name = re.sub(r"[^A-Za-z0-9._-]+", "_", unl.get("name", "card")).strip("_") or "card"
-            if args.output:
-                dst = Path(args.output)
-            else:
-                dst = Path(f"{name}_negated.png")
-            img.save(dst)
-            print(f"  -> {dst}  (Unlimited printing, not processed: "
-                  f"{img.width}x{img.height})")
-            return
-    faces = card_faces(card)
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", card.get("name", "card")).strip("_") or "card"
-    for i, face in enumerate(faces):
+def negate_card_faces(card, args):
+    """Negate every face of a Scryfall card. Returns a list of
+    (face, output image, stats) - two entries for transform / modal_dfc cards
+    (the physical card has a second side with its own image), one otherwise.
+    Used by process_card."""
+    results = []
+    for i, face in enumerate(card_faces(card)):
         uris = face.get("image_uris") or card.get("image_uris") or {}
         png = uris.get("png")
         if not png:
@@ -1413,14 +1402,49 @@ def process_url(link, args):
             continue
         img = Image.open(io.BytesIO(http_get(png)))
         out, stats = process_image(img, args, card=card, face=face)
+        results.append((face, out, stats))
+    return results
+
+
+def process_card(card, args):
+    """Process a whole Scryfall card into its output images, as
+    [(label, image, stats)]: the negated faces (both for transform /
+    modal_dfc - the physical card has two sides), or - when the oldest
+    printing of the card is Alpha - the Unlimited printing as-is with stats
+    None (2ed already has a white border, nothing is negated). Used by
+    process_url and by deck_to_pdf.py."""
+    unl = alpha_unlimited_printing(card)
+    if unl is not None:
+        png = card_png(unl)
+        if png:
+            print(f"  oldest printing of '{card.get('name')}' is Alpha (lea) - using the "
+                  f"Unlimited printing ({unl.get('set_name')} #{unl.get('collector_number')}) "
+                  f"as-is, not negated")
+            img = Image.open(io.BytesIO(http_get(png)))
+            return [(unl.get("name") or card.get("name") or "card",
+                     img.convert("RGBA"), None)]
+    return [(face.get("name") or card.get("name") or "card", out, stats)
+            for face, out, stats in negate_card_faces(card, args)]
+
+
+def process_url(link, args):
+    card = get_card(link)
+    results = process_card(card, args)
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", card.get("name", "card")).strip("_") or "card"
+    multi = len(results) > 1
+    for i, (label, out, stats) in enumerate(results):
         if args.output:
             p = Path(args.output)
-            dst = p if len(faces) == 1 else p.with_name(f"{p.stem}_face{i + 1}{p.suffix or '.png'}")
+            dst = p if not multi else p.with_name(f"{p.stem}_face{i + 1}{p.suffix or '.png'}")
         else:
-            dst = Path(f"{name}_negated.png" if len(faces) == 1
+            dst = Path(f"{name}_negated.png" if not multi
                         else f"{name}_face{i + 1}_negated.png")
         out.save(dst)
-        report(f"  face {i + 1} ({face.get('name', '')})", dst, out, stats)
+        if stats is None:
+            print(f"  -> {dst}  (Unlimited printing, not processed: "
+                  f"{out.width}x{out.height})")
+        else:
+            report(f"  face {i + 1} ({label})", dst, out, stats)
 
 
 def main():
@@ -1440,12 +1464,6 @@ def main():
                         "of the mask - covers the copyright / rarity / set info text and "
                         "the holostamp in the bottom band but not the card interior "
                         "(default: 20000)")
-    p.add_argument("--scale", type=float, default=1.0,
-                   help="upscale the output by this factor (LANCZOS) (default: 1.0)")
-    p.add_argument("--mpc", action="store_true",
-                   help=f"resize output to the MPC Autofill format: 63x88 mm card at the "
-                        f"press's max 800 DPI = {MPC_SIZE[0]}x{MPC_SIZE[1]} px PNG "
-                        f"(overrides --scale)")
     args = p.parse_args()
 
     if args.input.startswith(("http://", "https://")):

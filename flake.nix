@@ -22,11 +22,28 @@
           pythonEnv = pkgs.python3.withPackages (ps: [
             ps.pillow
             ps.numpy
+            ps.reportlab
           ]);
+          # both scripts in one store dir so deck_to_pdf.py can import
+          # negate_border.py when run via the nix store wrappers
+          src = pkgs.runCommand "magic_frame-src" { } ''
+            mkdir -p "$out"
+            cp ${./negate_border.py} "$out/negate_border.py"
+            cp ${./deck_to_pdf.py} "$out/deck_to_pdf.py"
+          '';
         in
-        pkgs.writeShellScriptBin "negate-border" ''
-          exec ${pythonEnv}/bin/python3 ${./negate_border.py} "$@"
-        '';
+        pkgs.symlinkJoin {
+          name = "magic_frame";
+          paths = [
+            src
+            (pkgs.writeShellScriptBin "negate-border" ''
+              exec ${pythonEnv}/bin/python3 ${src}/negate_border.py "$@"
+            '')
+            (pkgs.writeShellScriptBin "deck-to-pdf" ''
+              exec ${pythonEnv}/bin/python3 ${src}/deck_to_pdf.py "$@"
+            '')
+          ];
+        };
     in
     {
       packages = forAllSystems (pkgs: {
@@ -47,11 +64,13 @@
             (pkgs.python3.withPackages (ps: [
               ps.pillow
               ps.numpy
+              ps.reportlab
             ]))
           ];
           shellHook = ''
             echo "magic_frame dev shell"
             echo "  run the tool:      negate-border <scryfall-url|image-file|dir>"
+            echo "  deck to pdf:       deck-to-pdf <decklist> -o out.pdf"
             echo "  or via nix:        nix run .#default -- <scryfall-url>"
             echo "  reference masks: ref_masks_clean/ (manual, looked up first), then ref_masks/ (generated cache)"
           '';
