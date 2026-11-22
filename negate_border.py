@@ -59,9 +59,9 @@ face for transform / modal_dfc cards - second faces are only processed for
 those layouts). Each face of a two-faced card gets the reference mask of its
 own characteristics (e.g. a planeswalker back side gets the planeswalker_back
 mask, a modal_dfc planeswalker the modal_planeswalker_back one); a back side
-never carries a holostamp or the DFC mark. Planeswalker (and spacecraft) faces
-further intersect the calculated mask with the one autodetected on the card
-itself.
+never carries a holostamp or the DFC mark. Planeswalker, spacecraft and saga
+faces further intersect the calculated mask with the one autodetected on the
+card itself (their frame differs inside the border ring).
 
 Requires pillow + numpy (provided by the flake devShell:
 nix develop --command python3 negate_border.py IMAGE)
@@ -845,10 +845,17 @@ def ref_key(card, face):
     either - the dfc bucket is assumed from the release date.
     Each face of a two-faced card gets the characteristics of its own face:
     the face's frame_effects are used when Scryfall provides them (otherwise
-    the card-level ones), and the type line is face-first - so e.g. the
-    planeswalker back side of a modal_dfc card gets the planeswalker base. A
-    back side (second face of a transform/modal_dfc card, or the back of a
-    meld card) never carries a holostamp and never the DFC mark.
+    the card-level ones, with "legendary" reconciled against the face's own
+    type line), and the type line is face-first - so e.g. the planeswalker
+    back side of a modal_dfc card gets the planeswalker base, and the saga
+    front of a transform card (card layout "transform") gets the saga base,
+    seen as a non-legendary saga while a legendary-creature back gets the
+    crowned variant. A back side (second face of a transform/modal_dfc card,
+    or the back of a meld card) never carries a holostamp and never the DFC
+    mark. A face that is both a creature and a saga (Enchantment Creature —
+    Saga) keeps the creature frame: the creature mask wins over the saga
+    one, and the saga inner frame is handled when the mask is applied
+    (intersection with the autodetected mask, like spacecraft).
     Examples: 2015_default_creature+stamp, 2015_default_other+stamp,
     2015_default_creature+dfc+stamp,
     2015_default_legendary_creature_crowned+stamp, 2003_leveler, 2015_saga.
@@ -859,13 +866,20 @@ def ref_key(card, face):
     tl = (face.get("type_line") or card.get("type_line") or "").lower()
     # per-face frame effects: when the face carries its own (non-None)
     # frame_effects they are used alone, otherwise the card-level effects
-    # apply - so a card-level mark (e.g. "legendary") does not leak onto a
-    # back face that does not have it itself
+    # apply. On a two-faced card the card-level effects are the union of both
+    # faces', so "legendary" is reconciled with this face's own type line -
+    # e.g. the non-legendary saga front of a transform card whose back is a
+    # legendary creature must not inherit the legendary mark
     face_effects = face.get("frame_effects") if face is not card else None
     if face_effects is not None:
         effects = {str(e).lower() for e in face_effects}
     else:
         effects = {str(e).lower() for e in (card.get("frame_effects") or [])}
+    if len(card.get("card_faces") or []) > 1 and face is not card:
+        if "legendary" in tl and "planeswalker" not in tl:
+            effects.add("legendary")
+        else:
+            effects.discard("legendary")
     keywords = {str(k).lower() for k in (card.get("keywords") or [])
                 + (face.get("keywords") or [])}
     if card_set == "leb":
@@ -884,6 +898,11 @@ def ref_key(card, face):
         # battles (Battle — Siege) are transform-layout cards; the card type
         # identifies them since layout:battle is not a Scryfall qualifier
         base = "battle"
+    elif any(t in tl for t in ("saga", "class", "case")):
+        # sagas - and class / case cards, which share the saga frame - are
+        # also detected from the type line, so that e.g. the saga front of a
+        # transform card (card layout "transform") gets the saga base
+        base = "saga"
     elif layout == "split":
         sub = next((s for kw, s in SPLIT_KEYWORDS if kw in keywords), "regular")
         base = f"split_{sub}"
@@ -910,6 +929,13 @@ def ref_key(card, face):
         # that base (creatures combine through the variant instead, like
         # for the default base)
         base = f"modal_{base}"
+    if base in ("saga", "modal_saga") and ("creature" in tl or "vehicle" in tl):
+        # a face that is both a creature and a saga (Enchantment Creature —
+        # Saga, whatever the card layout) keeps the creature frame: the
+        # creature mask wins over the saga one, and the saga inner frame is
+        # handled when the mask is applied (intersection with the
+        # autodetected mask, like spacecraft)
+        base = "default" if base == "saga" else "modal"
     # a back side never has a holostamp and never the DFC mark: the second
     # face of a transform/modal_dfc card, or the back of a meld card
     faces = card.get("card_faces") or []
@@ -1284,10 +1310,12 @@ def process_image(img, args, card=None, face=None):
     white reference for the card's characteristics; otherwise (or when no
     reference exists) it is detected on the image itself - and, when a key is
     known, cached under that key so later runs load it instead of
-    re-detecting. Spacecraft (Artifact — Spacecraft) and planeswalkers have a
-    frame that differs inside the border ring: their mask is the intersection
-    of the calculated reference mask (the one a plain card of the same
-    characteristics would use) and the mask autodetected on the card itself."""
+    re-detecting. Spacecraft (Artifact — Spacecraft), planeswalkers and sagas
+    (including creature-sagas, which use the creature mask) have a frame
+    that differs inside the border ring: their mask is the intersection of
+    the calculated reference mask (the one a plain card of the same
+    characteristics would use) and the mask autodetected on the card
+    itself."""
     region, border, border_hex = detect_region(
         img, threshold=args.threshold, max_hole=args.max_hole)
     stats = {"found": False, "frac": 0.0, "border": border_hex, "mask": "none"}
@@ -1295,8 +1323,7 @@ def process_image(img, args, card=None, face=None):
     mask = None
     src = None
     key = None
-    spacecraft = False
-    planeswalker = False
+    intersect_why = None   # set when the frame differs inside the border ring
     if card is not None:
         layout = (card.get("layout") or "").lower()
         if layout in LAYOUT_UNSUPPORTED:
@@ -1305,9 +1332,18 @@ def process_image(img, args, card=None, face=None):
             return img.convert("RGBA"), stats
         f = face or card
         tl = (f.get("type_line") or card.get("type_line") or "").lower()
-        spacecraft = "spacecraft" in tl
-        planeswalker = "planeswalker" in tl
-        key = ref_key(card, f).key
+        spec = ref_key(card, f)
+        key = spec.key
+        if "spacecraft" in tl:
+            intersect_why = "spacecraft"
+        elif "planeswalker" in tl:
+            intersect_why = "planeswalker"
+        elif spec.base == "saga" or any(t in tl for t in ("saga", "class", "case")):
+            # sagas (and class / case, which share the saga frame) have the
+            # chapter track inside the border ring - also on a creature-saga
+            # face, which gets the creature mask (see ref_key) but still has
+            # the saga inner frame
+            intersect_why = "saga"
         mask, src = reference_mask(key, card, f, args)
         if mask is None:
             print(f"  warning: no white reference card found for '{key}' "
@@ -1317,21 +1353,20 @@ def process_image(img, args, card=None, face=None):
             # one (self-detected masks are skipped - they already fit)
             cmask = card_mask(img)
             mask = resize_mask(mask, cmask.shape[0], cmask.shape[1])
-            if (spacecraft or planeswalker) and region is not None and region.any():
-                # spacecraft and planeswalker frames differ inside the border
-                # ring (a planeswalker back side even more so than a front):
-                # intersect the calculated mask (the one a plain card of the
-                # same characteristics would use) with the autodetected mask
-                why = "spacecraft" if spacecraft else "planeswalker"
+            if intersect_why and region is not None and region.any():
+                # frames that differ inside the border ring (spacecraft,
+                # planeswalkers - a back side even more than a front - and
+                # sagas with their chapter track): intersect the calculated
+                # reference mask with the mask autodetected on the card
                 inter = (mask > 0) & region
                 if inter.any():
                     mask = inter.astype(np.float32)
-                    src = f"{src} (intersected with the autodetected mask: {why})"
+                    src = f"{src} (intersected with the autodetected mask: {intersect_why})"
                 else:
                     print("  warning: empty intersection with the autodetected "
                           "mask - using the autodetected mask alone")
                     mask = region.astype(np.float32)
-                    src = f"{src} (autodetected only: {why})"
+                    src = f"{src} (autodetected only: {intersect_why})"
             # the blend band is derived at apply time (apply_mask), masks
             # stay binary here
             mask, info = align_mask(mask, img, border)
@@ -1347,12 +1382,17 @@ def process_image(img, args, card=None, face=None):
             return img.convert("RGBA"), stats
         mask = mask_from_region(region, card_mask(img))
         src = "detected on the card itself"
-        if key is not None and not spacecraft:
-            # spacecraft masks are not cached under the plain key: their frame
-            # differs, the mask is intersected with the autodetected one above
-            # when a reference exists
-            # cache the self-detected mask under the key too, so later runs
-            # with the same characteristics load it from the cache
+        if (key is not None and intersect_why != "spacecraft"
+                and not (intersect_why == "saga" and spec.base != "saga")):
+            # a self-detected mask is not cached under the plain key when the
+            # frame differs inside the border ring but the key is not specific
+            # to that frame: spacecraft always, and creature-sagas (their key
+            # is the plain creature one, but their mask carries the saga
+            # chapter track). The mask is intersected with the autodetected
+            # one above when a reference exists. Saga / planeswalker keys are
+            # specific to that frame, so their self-detected masks can be
+            # cached; cache the self-detected mask under the key too, so later
+            # runs with the same characteristics load it from the cache
             path = REF_DIR / f"{key}.png"
             print(f"  generating new mask '{key}' from the card itself "
                   f"'{card.get('name')}' (no white reference available)")
