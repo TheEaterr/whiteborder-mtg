@@ -59,7 +59,8 @@ for a directory, <card>_negated.png for a URL (or <card>_faceN_negated.png per
 face for transform / modal_dfc cards - second faces are only processed for
 those layouts). Each face of a two-faced card gets the reference mask of its
 own characteristics (e.g. a planeswalker back side gets the planeswalker
-mask); a back side never carries a holostamp or the DFC mark.
+mask, a modal_dfc planeswalker the modal_planeswalker one); a back side never
+carries a holostamp or the DFC mark.
 
 Requires pillow + numpy (provided by the flake devShell:
 nix develop --command python3 negate_border.py IMAGE)
@@ -198,6 +199,10 @@ def stamp_of(card, face=None):
 # stamps sharing the regular oval stamp's artwork and position are aliased
 # to it
 STAMP_ALIASES = {"acorn": "oval", "heart": "oval"}
+# every Scryfall security_stamp value (the stamp: qualifier's domain): a card
+# without a stamp must not take a stamped reference, so "no stamp" is queried
+# as a negation of each value
+STAMP_VALUES = {"oval", "triangle", "acorn", "heart", "arena", "circle"}
 
 
 def stamp_key(stamp):
@@ -769,8 +774,12 @@ def ref_key(card, face):
     base: leb, spree, planeswalker, room (Enchantment — Room, split layout),
     battle (Battle — ..., detected from the type line since layout:battle is
     not a Scryfall qualifier), split_<fuse|aftermath|regular>, saga (also
-    class/case), modal (modal_dfc), leveler, meld (the back side of a
-    meld card - the front carries the meld mark and is a normal card), or
+    class/case), modal (modal_dfc - not exclusive with the other bases: a
+    modal_dfc planeswalker / battle / ... face gets modal_planeswalker /
+    modal_battle / ..., like creatures combine through the variant), leveler,
+    meld (the back side of a
+    meld card - the front is a normal card carrying the meld mark, dfc
+    bucket), or
     "default" for normal and the same-as-normal layouts - e.g. leveler exists
     both as 2003_leveler and 2015_leveler;
     variant: legendary_<creature|other>_crowned when the face carries the
@@ -788,10 +797,12 @@ def ref_key(card, face):
     has.
     A transform front always carries a DFC mark, so when Scryfall does not
     report the frame effect the dfc bucket is assumed (battles are exempt -
-    their transform layout carries no DFC mark). From Marvel's Spider-Man
-    (SPIDERMAN_DATE) on, modal_dfc fronts carry the same DFC mark, which
-    Scryfall does not report either - the dfc bucket is assumed from the
-    release date.
+    their transform layout carries no DFC mark). A meld front carries the
+    same mark in the same spot - Scryfall only reports it (as mooneldrazidfc)
+    on the original Eldritch Moon printings - so the dfc bucket is assumed
+    for meld fronts as well. From Marvel's Spider-Man (SPIDERMAN_DATE) on,
+    modal_dfc fronts carry the same DFC mark, which Scryfall does not report
+    either - the dfc bucket is assumed from the release date.
     Each face of a two-faced card gets the characteristics of its own face:
     the face's frame_effects are used when Scryfall provides them (otherwise
     the card-level ones), and the type line is face-first - so e.g. the
@@ -853,6 +864,12 @@ def ref_key(card, face):
         # border; transform/meld marks come from the frame effects (dfc
         # bucket)
         base = "default"
+    if layout == "modal_dfc" and base != "modal":
+        # modal is not exclusive with the other bases: a modal_dfc face that
+        # is a planeswalker / battle / ... carries the modal frame on top of
+        # that base (creatures combine through the variant instead, like
+        # for the default base)
+        base = f"modal_{base}"
     # a back side never has a holostamp and never the DFC mark: the second
     # face of a transform/modal_dfc card, or the back of a meld card
     faces = card.get("card_faces") or []
@@ -890,14 +907,17 @@ def ref_key(card, face):
         buckets = [b for b in buckets if b not in ("dfc", "fandfc")]
     elif not {"dfc", "fandfc"} & set(buckets) and (
             (layout == "transform" and base != "battle")
+            or layout == "meld"
             or (layout == "modal_dfc"
                 and (card.get("released_at") or "") >= SPIDERMAN_DATE)):
-        # a transform front always carries a DFC mark - when Scryfall does
-        # not report the frame effect, the dfc bucket is assumed (fandfc is
-        # its own mark and counts as one). Battles are exempt: their
-        # transform layout carries no DFC mark. From Marvel's Spider-Man
-        # (SPIDERMAN_DATE) on, a modal_dfc front carries the same mark,
-        # which Scryfall does not report either
+        # a transform front always carries a DFC mark, and a meld front the
+        # same meld mark in the same spot (a meld back is a back side and
+        # takes the branch above) - when Scryfall does not report the frame
+        # effect, the dfc bucket is assumed (fandfc is its own mark and
+        # counts as one). Battles are exempt: their transform layout carries
+        # no DFC mark. From Marvel's Spider-Man (SPIDERMAN_DATE) on, a
+        # modal_dfc front carries the same mark, which Scryfall does not
+        # report either
         buckets = sorted(set(buckets) | {"dfc"})
     stamp = None if is_back else stamp_of(card, face)
     extras = {b for b in buckets if b not in ("legendary", "spree")}
@@ -922,20 +942,26 @@ def ref_search_query(base, layout, era, buckets, typecat,
     card type (creature / non-creature - for the default and modal bases in
     the 2015 frame only, or when crowned; not queried for a back side, see
     back=), the frame-effect buckets and the
-    holostamp (stamp: raw security_stamp of the asked card, None = no stamp,
-    queried directly as stamp:<value>, aliased so e.g. "acorn" queries as
-    stamp:oval) are
+    holostamp (stamp: raw security_stamp of the asked card - queried directly
+    as stamp:<value>, aliased so e.g. "acorn" queries as stamp:oval; None = no
+    stamp, queried as a negation of every stamp value) are
     matched with layout: / frame: / kw: / t: / stamp: qualifiers - and every
     characteristic the asked card does NOT have is negated as well
     (-frame:..., -layout:..., -kw:..., -t:...), so results only contain cards
     with exactly the same frame. pw_back queries the unique back frame of
-    transform cards that are planeswalkers on both sides.
+    transform cards that are planeswalkers on both sides. A composite
+    modal_<base> (a modal_dfc face carrying another base, e.g. a planeswalker)
+    queries the <base> plus layout:modal_dfc.
     A dfc bucket assumed from the release date (modal_dfc fronts from
     Marvel's Spider-Man / SPIDERMAN_DATE on - Scryfall reports no frame
     effect for that mark) is not queried as a frame effect; candidates are
     matched client-side through their own key instead.
     Alpha (lea) is always excluded - Beta (leb) is taken instead."""
     want = set(buckets or ()) - {"legendary", "spree"}
+    # a composite modal_X base (modal is not exclusive with the other bases):
+    # query the X base and require the modal layout on top of it
+    modal = base.startswith("modal_")
+    sub_base = base.split("_", 1)[1] if modal else base
     if (layout == "modal_dfc" and "dfc" in want
             and (released_at or "") >= SPIDERMAN_DATE):
         # the dfc mark of a Spider-Man-era modal_dfc front is not a reported
@@ -947,44 +973,47 @@ def ref_search_query(base, layout, era, buckets, typecat,
         # both sides: only another such card has it (on its back side)
         parts = ["layout:transform", "t:planeswalker", "t:legendary",
                  f"frame:{era}"]
-    elif base.startswith("split_"):
+    elif sub_base.startswith("split_"):
         parts = ["layout:split", f"frame:{era}"]
-        sub = base.split("_", 1)[1]
-        if sub != "regular":
-            parts.append(f"kw:{sub}")
-    elif base == "planeswalker":
+        kw = sub_base.split("_", 1)[1]
+        if kw != "regular":
+            parts.append(f"kw:{kw}")
+    elif sub_base == "planeswalker":
         # layout:planeswalker matches nothing on Scryfall, t:planeswalker does;
         # constrain the frame era as well (2003 Lorwyn frame vs 2015+)
         parts = ["t:planeswalker", f"frame:{era}"]
-    elif base == "spree":
+    elif sub_base == "spree":
         parts = ["kw:spree", f"frame:{era}"]
-    elif base == "room":
+    elif sub_base == "room":
         # rooms have a split layout but their own frame: query the room type
         parts = ["t:room", f"frame:{era}"]
-    elif base == "battle":
+    elif sub_base == "battle":
         # layout:battle is not a Scryfall search qualifier - the card type
         # identifies battles
         parts = ["t:battle", f"frame:{era}"]
-    elif base in ("saga", "modal", "leveler", "meld"):
+    elif sub_base in ("saga", "modal", "leveler", "meld"):
         # class/case share the saga frame, so query sagas for them
-        lay = "saga" if base == "saga" else layout
+        lay = "saga" if sub_base == "saga" else layout
         parts = [f"layout:{lay}", f"frame:{era}"]
     else:
         # normal and the same-as-normal layouts: the frame era alone
         parts = [f"frame:{era}"]
+    if modal:
+        parts.append("layout:modal_dfc")
     parts.append("-set:lea")
     parts.append("-set:leb")           # Alpha and Beta are never chosen
     parts.append("c=w")                # Magic color white: border very distinct
     # the holostamp is part of the mask, so the reference must carry the same
     # stamp - searched directly (stamp:<value>, aliased via STAMP_ALIASES so
     # e.g. "acorn" queries as the oval stamp, which shares its artwork and
-    # position). For no stamp no query clause is needed - the client-side key
-    # comparison in find_white_reference drops wrongly-stamped candidates
-    # (frames older than 2015 never had stamps, and there the key comparison
-    # passes trivially)
+    # position). For no stamp every stamp value is negated instead: the
+    # client-side key comparison alone would let a stamped card through for
+    # a back-side comparison (a back side never has a stamp)
     if stamp:
         s = str(stamp).lower()
         parts.append("stamp:" + STAMP_ALIASES.get(s, s))
+    else:
+        parts.extend(f"-stamp:{s}" for s in sorted(STAMP_VALUES))
     if crowned:
         # the legendary crown (frame effect "legendary", Dominaria 2018+);
         # t:legendary, not is:legendary - the latter matches non-legendary
@@ -996,7 +1025,7 @@ def ref_search_query(base, layout, era, buckets, typecat,
         # are excluded. Without the crown legendary does not change the
         # frame, so no positive legendary clause is needed either
         parts.append("-frame:legendary")
-    if not back and (crowned or (base in ("default", "modal") and era == "2015")):
+    if not back and (crowned or (sub_base in ("default", "modal") and era == "2015")):
         # creature and non-creature frames differ (power/toughness box) only
         # in the 2015 frame (default and modal bases), or when crowned; the
         # other frames share one border ring. Skipped for a back side: card
@@ -1020,9 +1049,9 @@ def ref_search_query(base, layout, era, buckets, typecat,
         if "dfc" not in want and "fandfc" not in want:
             # no DFC mark on the asked card: plain cards only
             parts.append("-layout:transform")
-    if base != "modal":
+    if not modal and base != "modal":
         parts.append("-layout:modal_dfc")
-    if base != "spree":
+    if sub_base != "spree":
         parts.append("-kw:spree")
     # spacecraft frames differ inside the border ring, so a spacecraft is never
     # used as a reference (a spacecraft card gets the plain reference mask,
@@ -1046,18 +1075,14 @@ def card_png(c):
 
 def candidate_key(c, back=False):
     """Reference key of a search-result card, computed on its front face - or
-    on its back face when back=True. For a back-side comparison the stamp and
-    DFC-mark extras are stripped (back sides never carry them), so a plain
-    card can match a back face of the same frame."""
+    on its back face when back=True and it has one. A back face never carries
+    the stamp or DFC-mark extras (ref_key drops them for a back side), so a
+    plain card can match a back face of the same frame; a single-faced
+    candidate keeps its full front key, stamp included, so a stamped card
+    cannot match an unstamped back."""
     faces = c.get("card_faces") or []
     face = faces[-1] if (back and len(faces) > 1) else (faces[0] if faces else c)
-    key = ref_key(c, face).key
-    if back:
-        head, _, extras = key.partition("+")
-        keep = [e for e in extras.split("+")
-                if e and not e.startswith("stamp") and e not in ("dfc", "fandfc")]
-        key = head + ("+" + "+".join(keep) if keep else "")
-    return key
+    return ref_key(c, face).key
 
 
 def reference_png(ref, back=False):
