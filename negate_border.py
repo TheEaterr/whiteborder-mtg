@@ -85,13 +85,14 @@ USER_AGENT = "magic-frame/1.0 (negate-border card tool)"
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
-# mask values of the inner edge of the border mask, as stamped by
-# float_mask_from_region: the innermost FLAT_EDGE_PX+1 lines get an increasing
-# gray gradient (i+1)/(FLAT_EDGE_PX+1) from inside out (the blend band);
-# elsewhere in the region mask 1 is fully negated (255 - pixel), 0 is
-# untouched. At apply time the gray value of each mask pixel is read from the
-# mask itself and used as the blend weight toward the NEW border color of the
-# card (255 minus the detected border color, so light / white-ish):
+# masks are stored binary (fully white inside the region, black outside).
+# The inner edge blend band is added programmatically at apply time by
+# float_mask_from_region: the innermost FLAT_EDGE_PX+1 lines of the region
+# get an increasing gray gradient (i+1)/(FLAT_EDGE_PX+1) from inside out;
+# elsewhere in the mask 1 is fully negated (255 - pixel), 0 is untouched.
+# The gray value of each band pixel is read from the in-memory mask and used
+# as the blend weight toward the NEW border color of the card (255 minus the
+# detected border color, so light / white-ish):
 #     new = new_border * gray + old * (1 - gray)
 FLAT_EDGE_PX = 2
 
@@ -180,13 +181,6 @@ def has_crown(card, face=None):
     non-legendary cards share the same border ring."""
     face = face or {}
     tl = (face.get("type_line") or card.get("type_line") or "").lower()
-    face_effects = face.get("frame_effects") if face is not card else None
-    if face_effects is not None:
-        effects = {str(e).lower() for e in face_effects}
-    else:
-        effects = {str(e).lower() for e in (card.get("frame_effects") or [])}
-    if "legendary" in effects:
-        return True
     return bool("legendary" in tl and "planeswalker" not in tl
                 and frame_era(card.get("frame", "")) in ("2015", "future")
                 and (card.get("released_at") or "") >= CROWN_DATE)
@@ -302,7 +296,7 @@ def scryfall_api_url(link):
 # digital cards have different images), black-bordered default printings, no
 # promos, and neither Alpha nor Beta (lea/leb - their scans are off)
 COMMON_QUERY_TOKENS = ("(game:paper)", "border:black", "-is:promo", "is:default",
-                       "-set:lea", "-set:leb")
+                       "-set:lea", "-set:leb", "-set:fbb", "-set:cei", "-set:ced", "-set:4bb")
 
 
 def add_common_filters(uri):
@@ -327,13 +321,16 @@ def add_common_filters(uri):
         (u.scheme, u.netloc, u.path, urllib.parse.urlencode(params), u.fragment))
 
 
-def search_all(uri, paginate=True):
+def search_all(uri, paginate=True, common=True):
     """Follow a Scryfall search endpoint's pagination and return every result.
 
     Every search is restricted to paper printings ((game:paper) is injected
     into the query) - digital-only cards (Arena/MTGO) have different images.
-    With paginate=False only the first page of results is fetched."""
-    uri = add_common_filters(uri)
+    With paginate=False only the first page of results is fetched. With
+    common=False the COMMON_QUERY_TOKENS are not injected (Alpha printings
+    included)."""
+    if common:
+        uri = add_common_filters(uri)
     results = []
     while uri:
         data = json.loads(http_get(uri))
@@ -409,6 +406,32 @@ def oldest_printing(card):
     prints.sort(key=lambda c: (c.get("released_at") or "", (c.get("set") or "").lower(),
                                blandness(c), str(c.get("collector_number") or "")))
     return prints[0]
+
+
+def alpha_unlimited_printing(card):
+    """The Unlimited (2ed) printing of the card when its oldest printing is
+    Alpha (lea), else None. Alpha scans are off, so such a card is not run
+    through the tool - the Unlimited printing is returned as-is."""
+    uri = card.get("prints_search_uri")
+    if not uri and card.get("oracle_id"):
+        uri = ("https://api.scryfall.com/cards/search?q=oracle_id:"
+               + urllib.parse.quote(card["oracle_id"]) + "&unique=prints")
+    if not uri:
+        return None
+    # all printings, Alpha included (no COMMON_QUERY_TOKENS injected)
+    prints = [c for c in search_all(uri, common=False)
+              if c.get("oracle_id") == card.get("oracle_id")]
+    nonfoil = [c for c in prints if not (c.get("foil") and not c.get("nonfoil"))]
+    if nonfoil:
+        prints = nonfoil
+    if not prints:
+        return None
+    key = lambda c: (c.get("released_at") or "", (c.get("set") or "").lower(),
+                     blandness(c), str(c.get("collector_number") or ""))
+    if (min(prints, key=key).get("set") or "").lower() != "lea":
+        return None
+    unl = [c for c in prints if (c.get("set") or "").lower() == "2ed"]
+    return min(unl, key=key) if unl else None
 
 
 def card_faces(card):
@@ -631,10 +654,12 @@ def float_mask_from_region(region, card):
 
 
 def mask_from_region(region, card):
-    """Grayscale float mask from a binary border region: the region is grown by
-    one pixel into the card interior first, so the blend band at the inner
-    edge is not part of the border itself."""
-    return float_mask_from_region(dilate8(region) & card, card)
+    """Binary float mask (0/1) from a binary border region: the region is
+    grown by one pixel into the card interior first, so the blend band at the
+    inner edge is not part of the border itself. The blend band is not stored:
+    it is added programmatically at apply time (float_mask_from_region in
+    apply_mask), so saved masks are fully white."""
+    return (dilate8(region) & card).astype(np.float32)
 
 
 def resize_mask(mask, h, w):
@@ -722,9 +747,8 @@ def align_mask(mask, img, border, threshold=ALIGN_THRESHOLD):
     r = shift_clamp(grows[g], dy, dx) & card
     if r.sum() < ALIGN_MIN_COVER * base:
         return mask, None
-    m = float_mask_from_region(r, card)
     info = {"shift": (dy, dx), "grow": g, "fp": fp, "fn": fn}
-    return m, info
+    return r.astype(np.float32), info   # binary; the blend band is added at apply time
 
 
 # ------------------------------------------------------- reference cards
@@ -818,8 +842,10 @@ def ref_key(card, face):
         # the back side of a meld card (letter-suffixed collector number, e.g.
         # emn/15b) is its own layout; the front is a normal card
         base = "meld"
+    elif layout in MULTI_FACE_LAYOUTS:
+        base = "default"
     elif layout not in LAYOUT_SAME_AS_NORMAL and layout != "normal":
-        print("warning: unsupported layout")
+        print(f"warning: unsupported layout: {layout}, using default.")
         base = "default"
     else:
         # normal cards and the same-as-normal layouts (flip, adventure,
@@ -1139,11 +1165,12 @@ def reference_mask(key, card, face, ref_dir, args):
 def apply_mask(img, mask, border=None, scale=1.0, mpc=False):
     """Negate the card inside the border mask.
 
-    mask 1 (resized to the card, NEAREST so the mask levels survive) -> pixel
-    inverted (255 - pixel); 0 -> untouched. The inner edge pixels
-    (0 < mask < 1: the blend band lines of the mask) blend the NEW border
-    color of the card into the pixel, each with its own mask gray value read
-    from the mask as the blend weight:
+    The mask is binary (1 inside the region, 0 outside; stored masks are
+    fully white). It is resized to the card (NEAREST) and the inner edge
+    blend band is derived programmatically from it (float_mask_from_region):
+    mask 1 -> pixel inverted (255 - pixel); 0 -> untouched. The band pixels
+    (0 < mask < 1) blend the NEW border color of the card into the pixel,
+    each with its own mask gray value read from the mask as the blend weight:
         new = new_border * gray + old * (1 - gray)
     where new_border = 255 - border (border: the detected border color of this
     card, so light / white-ish). Without a border color the inner edge pixels
@@ -1153,6 +1180,9 @@ def apply_mask(img, mask, border=None, scale=1.0, mpc=False):
     cmask = card_mask(img)
     h, w = cmask.shape
     mask = resize_mask(mask, h, w)
+    # the blend band is not stored in the mask: derive it here from the
+    # binary region, so saved masks stay fully white
+    mask = float_mask_from_region(mask > 0, cmask)
     weight = (mask >= 1.0) & cmask                       # full negate
     inner = (mask > 0.0) & (mask < 1.0) & cmask          # inner edge
     a = weight[..., None].astype(np.float32)
@@ -1223,18 +1253,16 @@ def process_image(img, args, card=None, face=None):
                 # same characteristics would use) with the autodetected mask
                 inter = (mask > 0) & region
                 if inter.any():
-                    mask = float_mask_from_region(inter, cmask)
+                    mask = inter.astype(np.float32)
                     src = f"{src} (intersected with the autodetected mask: spacecraft)"
                 else:
                     print("  warning: empty intersection with the autodetected "
                           "mask - using the autodetected mask alone")
-                    mask = float_mask_from_region(region, cmask)
+                    mask = region.astype(np.float32)
                     src = f"{src} (autodetected only: spacecraft)"
+            # the blend band is derived at apply time (apply_mask), masks
+            # stay binary here
             mask, info = align_mask(mask, img, border)
-            if info is None:
-                # no adjustment: re-derive the mask levels so old cache
-                # entries (without the inner edge band) get them too
-                mask = float_mask_from_region(mask > 0, cmask)
             if info:
                 print(f"  adjusted mask to the card: shift {info['shift']}, "
                       f"grow {info['grow']} -> {info['fp']} non-black px covered, "
@@ -1292,6 +1320,25 @@ def process_dir(src, args):
 
 def process_url(link, args):
     card = get_card(link)
+    unl = alpha_unlimited_printing(card)
+    if unl is not None:
+        # the oldest printing is Alpha: return the Unlimited printing as-is,
+        # without going through the tool
+        png = card_png(unl)
+        if png:
+            print(f"  oldest printing of '{card.get('name')}' is Alpha (lea) - "
+                  f"returning the Unlimited printing ({unl.get('set_name')} "
+                  f"#{unl.get('collector_number')}) as-is, not negated")
+            img = Image.open(io.BytesIO(http_get(png)))
+            name = re.sub(r"[^A-Za-z0-9._-]+", "_", unl.get("name", "card")).strip("_") or "card"
+            if args.output:
+                dst = Path(args.output)
+            else:
+                dst = Path(f"{name}_negated.png")
+            img.save(dst)
+            print(f"  -> {dst}  (Unlimited printing, not processed: "
+                  f"{img.width}x{img.height})")
+            return
     faces = card_faces(card)
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", card.get("name", "card")).strip("_") or "card"
     for i, face in enumerate(faces):
