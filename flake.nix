@@ -53,7 +53,7 @@
             echo "magic_frame dev shell"
             echo "  run the tool:      negate-border <scryfall-url|image-file|dir>"
             echo "  or via nix:        nix run .#default -- <scryfall-url>"
-            echo "  reference masks are cached in ref_masks/ (override with --ref-dir)"
+            echo "  reference masks: ref_masks_clean/ (manual, looked up first), then ref_masks/ (generated cache)"
           '';
         };
       });

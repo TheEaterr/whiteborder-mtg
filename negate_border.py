@@ -9,8 +9,9 @@ but of the Magic color white -
 e.g. a white saga such as Elspeth Conquers Death for the black saga Age of
 Ultron - where the black border is very distinct against the white frame,
 detects the border on that reference, and stores it as a grayscale mask in the
-reference cache (ref_masks/, created on demand; override with --ref-dir).
-Later runs load the cached mask instead of downloading the reference again.
+reference cache (ref_masks/, created on demand). Later runs load the cached
+mask instead of downloading the reference again; manually cleaned-up masks in
+ref_masks_clean/ take precedence over the generated ones in ref_masks/.
 If no white reference exists for a frame, the border is detected on the asked
 card itself and the resulting mask is cached under the same key as well.
 
@@ -51,7 +52,7 @@ Usage:
     negate_border.py DIR [-o OUTDIR] [flags]
 
 Detection flags: --threshold / --max-hole.
-Output flags: --ref-dir (mask cache), --scale F, --mpc (MPC Autofill format:
+Output flags: --scale F, --mpc (MPC Autofill format:
 63x88 mm card at 800 DPI = 1984x2772 px).
 
 Default outputs: <name>_negated.<ext> next to the input file, <dir>-negated/
@@ -113,11 +114,28 @@ ALIGN_MIN_COVER = 0.6     # min fraction of the original mask size to keep
 ALIGN_THRESHOLD = 8       # max per-channel distance from the border color for
                           # a pixel to count as border during alignment
 
-# mask cache next to the script; when the script itself lives in a read-only
-# location (e.g. the nix store via `nix run`), fall back to ./ref_masks
+# mask caches next to the script: ref_masks_clean/ holds manually cleaned-up
+# masks and is looked up FIRST, ref_masks/ is the generated cache new masks
+# are saved to. When the script itself lives in a read-only location (e.g.
+# the nix store via `nix run`), fall back to ./ref_masks_clean and ./ref_masks
 _SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_REF_DIR = ((_SCRIPT_DIR / "ref_masks") if os.access(_SCRIPT_DIR, os.W_OK)
-                   else Path.cwd() / "ref_masks")
+if os.access(_SCRIPT_DIR, os.W_OK):
+    CLEAN_REF_DIR = _SCRIPT_DIR / "ref_masks_clean"
+    REF_DIR = _SCRIPT_DIR / "ref_masks"
+else:
+    CLEAN_REF_DIR = Path.cwd() / "ref_masks_clean"
+    REF_DIR = Path.cwd() / "ref_masks"
+REF_DIRS = (CLEAN_REF_DIR, REF_DIR)   # mask lookup order: clean masks first
+
+
+def cached_mask_path(key):
+    """Cached mask file for a key: the manually cleaned ref_masks_clean/
+    folder is looked up first, then the generated ref_masks/ cache."""
+    for d in REF_DIRS:
+        p = d / f"{key}.png"
+        if p.is_file():
+            return p
+    return None
 
 # Release date of Dominaria, the first set printed with the legendary crown
 # on the type line - Scryfall's frame effect "legendary" (searchable as
@@ -1165,11 +1183,13 @@ def find_white_reference(query, key=None, back=False):
     return pool[0]
 
 
-def reference_mask(key, card, face, ref_dir, args):
-    """Grayscale border mask for the key, from the cache or built from a white
-    reference card. Returns (mask float HxW or None, source description)."""
-    path = ref_dir / f"{key}.png"
-    if path.is_file():
+def reference_mask(key, card, face, args):
+    """Grayscale border mask for the key, from the cache (ref_masks_clean/
+    first, then ref_masks/) or built from a white reference card. New masks
+    are saved to ref_masks/. Returns (mask float HxW or None, source
+    description)."""
+    path = cached_mask_path(key)
+    if path is not None:
         m = np.asarray(Image.open(path).convert("L"), dtype=np.float32) / 255.0
         return m, f"cached {path}"
 
@@ -1192,7 +1212,8 @@ def reference_mask(key, card, face, ref_dir, args):
     if region is None or not region.any():
         return None, None
     mask = mask_from_region(region, card_mask(img))
-    ref_dir.mkdir(parents=True, exist_ok=True)
+    path = REF_DIR / f"{key}.png"
+    REF_DIR.mkdir(parents=True, exist_ok=True)
     Image.fromarray((mask * 255).round().astype(np.uint8), "L").save(path)
     print(f"  saved new mask to {path}")
     src = (f"reference '{ref.get('name')}' ({ref.get('set')}/{ref.get('collector_number')}, "
@@ -1280,7 +1301,7 @@ def process_image(img, args, card=None, face=None):
         spacecraft = "spacecraft" in tl
         planeswalker = "planeswalker" in tl
         key = ref_key(card, f).key
-        mask, src = reference_mask(key, card, f, Path(args.ref_dir), args)
+        mask, src = reference_mask(key, card, f, args)
         if mask is None:
             print(f"  warning: no white reference card found for '{key}' "
                   f"- detecting the border on the card itself")
@@ -1325,11 +1346,10 @@ def process_image(img, args, card=None, face=None):
             # when a reference exists
             # cache the self-detected mask under the key too, so later runs
             # with the same characteristics load it from the cache
-            ref_dir = Path(args.ref_dir)
-            path = ref_dir / f"{key}.png"
+            path = REF_DIR / f"{key}.png"
             print(f"  generating new mask '{key}' from the card itself "
                   f"'{card.get('name')}' (no white reference available)")
-            ref_dir.mkdir(parents=True, exist_ok=True)
+            REF_DIR.mkdir(parents=True, exist_ok=True)
             Image.fromarray((mask * 255).round().astype(np.uint8), "L").save(path)
             print(f"  saved new mask to {path}")
             src = f"self-detected on '{card.get('name')}' -> {path}"
@@ -1420,9 +1440,6 @@ def main():
                         "of the mask - covers the copyright / rarity / set info text and "
                         "the holostamp in the bottom band but not the card interior "
                         "(default: 20000)")
-    p.add_argument("--ref-dir", default=str(DEFAULT_REF_DIR),
-                   help=f"directory for the cached white-reference border masks "
-                        f"(default: {DEFAULT_REF_DIR})")
     p.add_argument("--scale", type=float, default=1.0,
                    help="upscale the output by this factor (LANCZOS) (default: 1.0)")
     p.add_argument("--mpc", action="store_true",
