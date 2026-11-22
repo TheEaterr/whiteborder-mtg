@@ -263,8 +263,14 @@ SPECIAL_PRINTING_EFFECTS = {"showcase", "extendedart", "borderless", "etched",
 
 # ---------------------------------------------------------------- HTTP / API
 
+# on a 429 (rate limited) take a small break before continuing; a Retry-After
+# header sent with the 429 is honored when it asks for a longer wait
+RATE_LIMIT_SLEEP = 5.0
+
+
 def http_get(url, timeout=60, retries=3):
-    """GET a URL with retries (Scryfall/scans CDN occasionally cut connections)."""
+    """GET a URL with retries (Scryfall/scans CDN occasionally cut connections).
+    A 429 rate-limit response pauses for RATE_LIMIT_SLEEP before retrying."""
     last = None
     for attempt in range(retries):
         try:
@@ -280,7 +286,19 @@ def http_get(url, timeout=60, retries=3):
                 return e.read()
             last = e
             if attempt + 1 < retries:
-                time.sleep(1.0 * (attempt + 1))
+                if e.code == 429:
+                    delay = RATE_LIMIT_SLEEP
+                    retry_after = e.headers.get("Retry-After") if e.headers else None
+                    if retry_after:
+                        try:
+                            delay = max(delay, float(retry_after))
+                        except ValueError:
+                            pass
+                    print(f"  rate limited (HTTP 429) - waiting {delay:.0f}s "
+                          f"before continuing")
+                    time.sleep(delay)
+                else:
+                    time.sleep(1.0 * (attempt + 1))
         except (urllib.error.URLError, http.client.IncompleteRead, OSError) as e:
             last = e
             if attempt + 1 < retries:
