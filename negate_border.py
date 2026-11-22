@@ -971,6 +971,10 @@ def ref_search_query(base, layout, era, buckets, typecat,
         parts.append("-layout:modal_dfc")
     if base != "spree":
         parts.append("-kw:spree")
+    # spacecraft frames differ inside the border ring, so a spacecraft is never
+    # used as a reference (a spacecraft card gets the plain reference mask,
+    # intersected with its own autodetected mask at apply time)
+    parts.append("-t:spacecraft")
     return " ".join(parts)
 
 
@@ -1154,7 +1158,10 @@ def process_image(img, args, card=None, face=None):
     white reference for the card's characteristics; otherwise (or when no
     reference exists) it is detected on the image itself - and, when a key is
     known, cached under that key so later runs load it instead of
-    re-detecting."""
+    re-detecting. Spacecraft (Artifact — Spacecraft) have a frame that differs
+    inside the border ring: their mask is the intersection of the reference
+    mask a non-spacecraft card would use and the mask autodetected on the card
+    itself."""
     region, border, border_hex = detect_region(
         img, threshold=args.threshold, max_hole=args.max_hole)
     stats = {"found": False, "frac": 0.0, "border": border_hex, "mask": "none"}
@@ -1162,14 +1169,18 @@ def process_image(img, args, card=None, face=None):
     mask = None
     src = None
     key = None
+    spacecraft = False
     if card is not None:
         layout = (card.get("layout") or "").lower()
         if layout in LAYOUT_UNSUPPORTED:
             print(f"  warning: layout '{layout}' is not supported "
                   f"- leaving the card unchanged")
             return img.convert("RGBA"), stats
-        key = ref_key(card, face or card).key
-        mask, src = reference_mask(key, card, face or card, Path(args.ref_dir), args)
+        f = face or card
+        tl = (f.get("type_line") or card.get("type_line") or "").lower()
+        spacecraft = "spacecraft" in tl
+        key = ref_key(card, f).key
+        mask, src = reference_mask(key, card, f, Path(args.ref_dir), args)
         if mask is None:
             print(f"  warning: no white reference card found for '{key}' "
                   f"- detecting the border on the card itself")
@@ -1178,6 +1189,19 @@ def process_image(img, args, card=None, face=None):
             # one (self-detected masks are skipped - they already fit)
             cmask = card_mask(img)
             mask = resize_mask(mask, cmask.shape[0], cmask.shape[1])
+            if spacecraft and region is not None and region.any():
+                # spacecraft frames differ inside the border ring: intersect
+                # the reference mask (the one a non-spacecraft card of the
+                # same characteristics would use) with the autodetected mask
+                inter = (mask > 0) & region
+                if inter.any():
+                    mask = float_mask_from_region(inter, cmask)
+                    src = f"{src} (intersected with the autodetected mask: spacecraft)"
+                else:
+                    print("  warning: empty intersection with the autodetected "
+                          "mask - using the autodetected mask alone")
+                    mask = float_mask_from_region(region, cmask)
+                    src = f"{src} (autodetected only: spacecraft)"
             mask, info = align_mask(mask, img, border)
             if info is None:
                 # no adjustment: re-derive the mask levels so old cache
@@ -1195,7 +1219,10 @@ def process_image(img, args, card=None, face=None):
             return img.convert("RGBA"), stats
         mask = mask_from_region(region, card_mask(img))
         src = "detected on the card itself"
-        if key is not None:
+        if key is not None and not spacecraft:
+            # spacecraft masks are not cached under the plain key: their frame
+            # differs, the mask is intersected with the autodetected one above
+            # when a reference exists
             # cache the self-detected mask under the key too, so later runs
             # with the same characteristics load it from the cache
             ref_dir = Path(args.ref_dir)
