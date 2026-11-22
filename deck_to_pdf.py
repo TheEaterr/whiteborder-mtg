@@ -18,12 +18,12 @@ Unlimited instead (2ed already has a white border) and used as-is.
 Double-faced cards (transform / modal_dfc) are duplicated: every copy prints
 its front AND its back, so the pair can be sleeved together.
 
-Scale: a real Magic card is 63 x 88 mm. The PDF places every image at exactly
-that size - in PDF points (1 pt = 1/72 inch, so 63 mm = 178.5827 pt) via
-reportlab's drawImage(width=..., height=...), never relying on the image's
-DPI metadata - in a centered 3x3 grid on each page, with a small gap between
-cards and thin cut guides. Print at 100% scale ("actual size", NOT "fit to
-page") and each card measures 63 x 88 mm.
+Scale: a real Magic card is 63 x 88 mm. Every image is placed at exactly that
+size in PDF points (1 pt = 1/72 inch, so 63 mm = 178.5827 pt) via reportlab's
+drawImage(width=..., height=...), never relying on the image's DPI metadata -
+in a centered 3x3 grid per page, with an optional gap and thin cut guides.
+Print at 100% scale ("actual size", NOT "fit to page") and each card measures
+63 x 88 mm.
 
 Usage:
     deck_to_pdf.py DECKLIST [-o out.pdf] [--page a4|letter] [--gap MM]
@@ -176,18 +176,12 @@ def main():
     p.add_argument("--page", choices=sorted(PAGE_SIZES), default="a4",
                    help="paper size of the PDF pages (default: a4)")
     p.add_argument("--gap", type=float, default=0.0,
-                   help="gap between cards in mm (default: 1.0)")
+                   help="gap between cards in mm (default: 0.0)")
     p.add_argument("--no-guides", action="store_true",
                    help="do not draw the light cut guides around each card")
     p.add_argument("--no-sideboard", action="store_true",
                    help="print only the main deck, skip the sideboard")
-    p.add_argument("--threshold", type=int, default=32,
-                   help="max per-channel distance from the detected border color for a "
-                        "pixel to count as border when detecting it on a card "
-                        "(default: 32)")
-    p.add_argument("--max-hole", type=int, default=20000,
-                   help="largest enclosed pocket inside the border that still becomes part "
-                        "of the mask (default: 20000)")
+    nb.add_detection_args(p)
     args = p.parse_args()
 
     if args.decklist == "-":
