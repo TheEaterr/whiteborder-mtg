@@ -27,6 +27,16 @@ that reference and stored as a grayscale **mask**, cached on disk:
 - `ref_masks_clean/` — manually cleaned-up masks, looked up **first**
   (committed to git)
 - `ref_masks/` — generated cache, new masks are written here (git-ignored)
+- `card_cache/` — caches (git-ignored):
+  - `<key>.png` + `<key>.json` — transformed card faces (key = card image URL +
+    detection flags); a face already negated is reloaded instead of being
+    downloaded and processed again
+  - `name_<key>.json` — deck-list name → resolved printing (a repeat run of the
+    same deck resolves every card with no Scryfall request)
+  - `unl_<key>.json` — oracle id → Alpha→Unlimited decision
+
+  HTTP requests are additionally paced ~100 ms apart so a full deck does not
+  trip Scryfall's rate limit; 429 responses still pause and retry.
 
 Mask files are named by a key describing the frame:
 
@@ -125,6 +135,15 @@ Sideboard
   its front AND its back, so the pair can be sleeved together.
 - `--page a4|letter` (default a4), `--gap MM` (default 0.0), `--no-guides`,
   `--no-sideboard`, plus the shared `--threshold` / `--max-hole`.
+- `--backs` inserts a card-back page (`back.png` next to the script) after every
+  front page, mirrored left-right. Front and back pages alternate (page 1 =
+  fronts, page 2 = their backs, ...), so each page pair shares one sheet when
+  printed double-sided with "flip on long edge" (the usual duplex default for
+  portrait pages) at 100% scale - every card back then lands exactly behind its
+  front.
+- `--x-offset MM` shifts the card-back pages horizontally relative to the
+  front pages (positive = right) to compensate for imperfect double-sided
+  printing; without `--backs` it shifts all pages.
 
 **Scale:** a real Magic card is 63 x 88 mm. Every image is placed at exactly
 that size in the PDF (in points, 63 mm = 178.5827 pt), in a centered 3x3 grid

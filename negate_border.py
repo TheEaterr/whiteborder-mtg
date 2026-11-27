@@ -14,6 +14,13 @@ border is detected on the asked card itself and cached under the same key.
 The border color of the processed card itself is sampled from its bottom
 edge and reported.
 
+Transformed cards are cached too (card_cache/, keyed by the card image URL
+and the detection flags): a face already negated is reloaded from disk
+instead of being downloaded and processed again. Card-name resolutions (deck
+lists, name_*.json) and Alpha->Unlimited decisions (unl_*.json) are cached
+there as well, and HTTP requests are paced ~100 ms apart, so a repeat run of
+the same deck list makes no Scryfall request at all.
+
 Inside the border the card is inverted (255 - pixel). The innermost
 FLAT_EDGE_PX + 1 mask lines are not fully negated: there the NEW border color
 (255 - the sampled border color, so light) is blended in, each pixel using
@@ -53,6 +60,7 @@ nix develop --command python3 negate_border.py IMAGE)
 """
 
 import argparse
+import hashlib
 import http.client
 import io
 import json
@@ -101,6 +109,52 @@ else:
     CLEAN_REF_DIR = Path.cwd() / "ref_masks_clean"
     REF_DIR = Path.cwd() / "ref_masks"
 REF_DIRS = (CLEAN_REF_DIR, REF_DIR)   # mask lookup order: clean masks first
+
+# transformed-card cache, same location rule as the mask caches: card_cache/
+# holds <key>.png (the negated face) + <key>.json (its stats), keyed by the
+# face's image URL and the detection flags, so a card is downloaded and
+# negated only once
+if os.access(_SCRIPT_DIR, os.W_OK):
+    CARD_CACHE_DIR = _SCRIPT_DIR / "card_cache"
+else:
+    CARD_CACHE_DIR = Path.cwd() / "card_cache"
+
+
+def card_cache_files(png_url, args):
+    key = hashlib.sha1(
+        f"{png_url}|t{args.threshold}|h{args.max_hole}".encode()).hexdigest()[:16]
+    return CARD_CACHE_DIR / f"{key}.png", CARD_CACHE_DIR / f"{key}.json"
+
+
+def load_cached_face(png_url, args):
+    """(image, stats) of a face already transformed, from card_cache/, or None."""
+    p, j = card_cache_files(png_url, args)
+    if not p.is_file():
+        return None
+    img = Image.open(p)
+    img.load()
+    stats = json.loads(j.read_text()) if j.is_file() else None
+    return img, stats
+
+
+def save_cached_face(png_url, args, img, stats):
+    CARD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    p, j = card_cache_files(png_url, args)
+    img.save(p)
+    j.write_text(json.dumps(stats))
+
+
+def name_cache_file(name):
+    """Resolution cache file for a deck-list card name (any card name, face
+    name, ... as written in the deck list)."""
+    key = hashlib.sha1(f"name|{name.strip().lower()}".encode()).hexdigest()[:16]
+    return CARD_CACHE_DIR / f"name_{key}.json"
+
+
+def unlimited_cache_file(oracle_id):
+    """Resolution cache file for the Alpha->Unlimited decision of an oracle id."""
+    key = hashlib.sha1(f"unl|{oracle_id}".encode()).hexdigest()[:16]
+    return CARD_CACHE_DIR / f"unl_{key}.json"
 
 
 def cached_mask_path(key):
@@ -224,12 +278,23 @@ SPECIAL_PRINTING_EFFECTS = {"showcase", "extendedart", "borderless", "etched",
 # header sent with the 429 is honored when it asks for a longer wait
 RATE_LIMIT_SLEEP = 5.0
 
+# Scryfall asks for ~50-100 ms between requests; pace them so processing a
+# whole deck does not trip the rate limit
+MIN_REQUEST_INTERVAL = 0.1
+_last_request_at = 0.0
+
 
 def http_get(url, timeout=60, retries=3):
     """GET a URL with retries (Scryfall/scans CDN occasionally cut connections).
-    A 429 rate-limit response pauses for RATE_LIMIT_SLEEP before retrying."""
+    Requests are paced to at least MIN_REQUEST_INTERVAL apart; a 429 rate-limit
+    response pauses for RATE_LIMIT_SLEEP (or Retry-After) before retrying."""
+    global _last_request_at
     last = None
     for attempt in range(retries):
+        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_at = time.monotonic()
         try:
             req = urllib.request.Request(
                 url, headers={"User-Agent": USER_AGENT,
@@ -415,21 +480,43 @@ def alpha_unlimited_printing(card):
     """The Unlimited (2ed) printing when the card's oldest printing is Alpha
     (lea), else None. Alpha scans are off, so such a card is not run through
     the tool - Unlimited is returned as-is. This is the only search that
-    includes Alpha (common=False): it has to see lea to detect it."""
+    includes Alpha (common=False): it has to see lea to detect it. The
+    decision is cached in card_cache/ by oracle id."""
+    key = card.get("oracle_id") or card.get("id") or ""
+    cf = unlimited_cache_file(key)
+    if cf.is_file():
+        return json.loads(cf.read_text())
     prints = all_printings(card, common=False)
-    if not prints or (prints[0].get("set") or "").lower() != "lea":
-        return None
-    unl = [c for c in prints if (c.get("set") or "").lower() == "2ed"]
-    return min(unl, key=printing_order) if unl else None
+    unl = None
+    if prints and (prints[0].get("set") or "").lower() == "lea":
+        candidates = [c for c in prints if (c.get("set") or "").lower() == "2ed"]
+        unl = min(candidates, key=printing_order) if candidates else None
+    CARD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cf.write_text(json.dumps(unl))
+    return unl
 
 
 def card_by_name(name):
-    """Scryfall card for a plain card name (deck lists): exact-name search
-    (printings whose own name is exactly the asked one are preferred - an
-    exact-name search also matches face names of other cards, e.g. "Lightning
-    Bolt" matches "Emeritus of Conflict // Lightning Bolt"), then the oldest
-    printing like get_card() does for a link. Falls back to Scryfall's fuzzy
-    lookup (a deck list may carry only one face's name of a DFC)."""
+    """Scryfall card for a plain card name (deck lists). The resolution is
+    cached in card_cache/ by (lower-cased) name - a repeat run of the same
+    deck list resolves every card with no Scryfall request. The cached value
+    may be None (name not found)."""
+    cf = name_cache_file(name)
+    if cf.is_file():
+        return json.loads(cf.read_text())
+    card = _resolve_card_by_name(name)
+    CARD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cf.write_text(json.dumps(card))
+    return card
+
+
+def _resolve_card_by_name(name):
+    """Exact-name search (printings whose own name is exactly the asked one are
+    preferred - an exact-name search also matches face names of other cards,
+    e.g. "Lightning Bolt" matches "Emeritus of Conflict // Lightning Bolt"),
+    then the oldest printing like get_card() does for a link. Falls back to
+    Scryfall's fuzzy lookup (a deck list may carry only one face's name of a
+    DFC)."""
     hits = search_cards(f'!"{name}"', paginate=False)
     exact = [c for c in hits if (c.get("name") or "").lower() == name.lower()]
     pool = exact or hits
@@ -1257,9 +1344,9 @@ def process_dir(src, args):
 
 
 def negate_card_faces(card, args):
-    """Negate every face of a Scryfall card; returns [(face, image, stats)]."""
-
-
+    """Negate every face of a Scryfall card; returns [(face, image, stats)].
+    Each transformed face is saved to card_cache/ and reloaded from there on
+    later runs instead of being downloaded and negated again."""
     results = []
     for i, face in enumerate(card_faces(card)):
         uris = face.get("image_uris") or card.get("image_uris") or {}
@@ -1267,8 +1354,14 @@ def negate_card_faces(card, args):
         if not png:
             print(f"  face {i + 1} ({face.get('name', '')}): no png, skipped")
             continue
-        img = Image.open(io.BytesIO(http_get(png)))
-        out, stats = process_image(img, args, card=card, face=face)
+        cached = load_cached_face(png, args)
+        if cached is not None:
+            out, stats = cached
+            print(f"  face {i + 1} ({face.get('name', '')}): loaded from card cache")
+        else:
+            out, stats = process_image(Image.open(io.BytesIO(http_get(png))),
+                                       args, card=card, face=face)
+            save_cached_face(png, args, out, stats)
         results.append((face, out, stats))
     return results
 
@@ -1285,9 +1378,13 @@ def process_card(card, args):
             print(f"  oldest printing of '{card.get('name')}' is Alpha (lea) - using the "
                   f"Unlimited printing ({unl.get('set_name')} #{unl.get('collector_number')}) "
                   f"as-is, not negated")
-            img = Image.open(io.BytesIO(http_get(png)))
-            return [(unl.get("name") or card.get("name") or "card",
-                     img.convert("RGBA"), None)]
+            cached = load_cached_face(png, args)
+            if cached is not None:
+                print("  image loaded from card cache")
+                return [(unl.get("name") or card.get("name") or "card", *cached)]
+            img = Image.open(io.BytesIO(http_get(png))).convert("RGBA")
+            save_cached_face(png, args, img, None)
+            return [(unl.get("name") or card.get("name") or "card", img, None)]
     return [(face.get("name") or card.get("name") or "card", out, stats)
             for face, out, stats in negate_card_faces(card, args)]
 

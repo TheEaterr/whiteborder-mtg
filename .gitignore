@@ -1,6 +1,7 @@
 __pycache__
 .direnv/*
 ref_masks/
+card_cache/
 /test_cards_negated/
 /result
 /decklists
