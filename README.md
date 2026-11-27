@@ -141,9 +141,9 @@ Sideboard
   printed double-sided with "flip on long edge" (the usual duplex default for
   portrait pages) at 100% scale - every card back then lands exactly behind its
   front.
-- `--x-offset MM` shifts the card-back pages horizontally relative to the
-  front pages (positive = right) to compensate for imperfect double-sided
-  printing; without `--backs` it shifts all pages.
+- `--x-offset MM` / `--y-offset MM` shift the card-back pages horizontally /
+  vertically relative to the front pages (positive = right / up) to compensate
+  for imperfect double-sided printing; without `--backs` they shift all pages.
 
 **Scale:** a real Magic card is 63 x 88 mm. Every image is placed at exactly
 that size in the PDF (in points, 63 mm = 178.5827 pt), in a centered 3x3 grid

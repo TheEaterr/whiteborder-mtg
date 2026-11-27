@@ -32,12 +32,12 @@ every front page, mirrored left-right: print double-sided with "flip on long
 edge" (the default duplex mode for portrait pages) at 100% scale and each card
 back lands exactly behind its front. Front and back pages alternate (page 1 =
 fronts, page 2 = their backs, ...), so each page pair shares one sheet.
---x-offset MM shifts the back pages horizontally relative to the fronts to
-compensate for imperfect double-sided printing.
+--x-offset MM / --y-offset MM shift the back pages horizontally / vertically
+relative to the fronts to compensate for imperfect double-sided printing.
 
 Usage:
     deck_to_pdf.py DECKLIST [-o out.pdf] [--page a4|letter] [--gap MM] [--backs]
-                                 [--x-offset MM]
+                                 [--x-offset MM] [--y-offset MM]
     deck_to_pdf.py -                        # read the deck list from stdin
 
 Requires pillow + numpy + reportlab (provided by the flake devShell:
@@ -135,28 +135,30 @@ def flatten(img):
 
 
 def build_pdf(entries, out_path, page_name, gap_mm, guides, backs=False, back_path=None,
-              x_offset_mm=0.0):
+              x_offset_mm=0.0, y_offset_mm=0.0):
     """Write the print-ready PDF: 3x3 grid of exactly 63x88 mm cards per page,
     centered, with `gap_mm` between cards and optional cut guides. With
     `backs`, a card-back page is added after each front page, mirrored
     left-right so duplex "flip on long edge" puts each back exactly behind
-    its front. `x_offset_mm` shifts content horizontally: with `backs`, only
+    its front. `x_offset_mm` / `y_offset_mm` shift content: with `backs`, only
     the back pages (to compensate imperfect double-sided printing); without
     `backs`, all pages. Returns (front_pages, total_pages)."""
     pw, ph = PAGE_SIZES[page_name]
     gap = gap_mm * mm
     x_off = x_offset_mm * mm
+    y_off = y_offset_mm * mm
     grid_w = COLS * CARD_W + (COLS - 1) * gap
     grid_h = ROWS * CARD_H + (ROWS - 1) * gap
-    if grid_w + abs(x_off) > pw or grid_h > ph:
+    if grid_w + abs(x_off) > pw or grid_h + abs(y_off) > ph:
         raise SystemExit(f"error: a {COLS}x{ROWS} grid of 63x88 mm cards with a "
-                         f"{gap_mm} mm gap and a {x_offset_mm} mm x-offset does not "
-                         f"fit a {page_name} page")
+                         f"{gap_mm} mm gap and offsets of {x_offset_mm} mm x / "
+                         f"{y_offset_mm} mm y does not fit a {page_name} page")
     ox, oy = (pw - grid_w) / 2.0, (ph - grid_h) / 2.0
     per_page = COLS * ROWS
 
-    def slot_xy(col, row, dx=0.0):   # top row first
-        return ox + col * (CARD_W + gap) + dx, oy + (ROWS - 1 - row) * (CARD_H + gap)
+    def slot_xy(col, row, dx=0.0, dy=0.0):   # top row first
+        return (ox + col * (CARD_W + gap) + dx,
+                oy + (ROWS - 1 - row) * (CARD_H + gap) + dy)
 
     c = pdfcanvas.Canvas(str(out_path), pagesize=PAGE_SIZES[page_name])
     c.setTitle(Path(out_path).stem)
@@ -172,12 +174,12 @@ def build_pdf(entries, out_path, page_name, gap_mm, guides, backs=False, back_pa
                 jpgs[key] = p
             return jpgs[key]
 
-        def draw_card(jpg, col, row, dx=0.0):
-            x, y = slot_xy(col, row, dx)
+        def draw_card(jpg, col, row, dx=0.0, dy=0.0):
+            x, y = slot_xy(col, row, dx, dy)
             # exact physical size: width/height in points, image DPI ignored
             c.drawImage(str(jpg), x, y, width=CARD_W, height=CARD_H)
 
-        def draw_guides(slots, dx=0.0):
+        def draw_guides(slots, dx=0.0, dy=0.0):
             # corner cut marks only: at every corner of every occupied card a
             # cross whose arms are 4 mm long (2 mm on each side of the corner).
             # An arm extends to the paper edge when no card blocks that
@@ -191,12 +193,12 @@ def build_pdf(entries, out_path, page_name, gap_mm, guides, backs=False, back_pa
             sx, sy = CARD_W + gap, CARD_H + gap
             corners = set()
             for col, row in occupied:
-                x, y = slot_xy(col, row, dx)
+                x, y = slot_xy(col, row, dx, dy)
                 corners.update(((x, y), (x + CARD_W, y),
                                 (x, y + CARD_H), (x + CARD_W, y + CARD_H)))
             for cx, cy in corners:
                 k = round((cx - ox - dx) / sx)      # vertical grid line, 0..COLS
-                m = round((cy - oy) / sy)           # horizontal grid line, 0..ROWS
+                m = round((cy - oy - dy) / sy)      # horizontal grid line, 0..ROWS
                 rows_adj = [r for r in (ROWS - 1 - m, ROWS - m) if 0 <= r < ROWS]
                 cols_adj = [c for c in (k - 1, k) if 0 <= c < COLS]
 
@@ -219,8 +221,8 @@ def build_pdf(entries, out_path, page_name, gap_mm, guides, backs=False, back_pa
                                 return cy + direction * arm   # 2 mm onto the adjacent card
                             # stop at the blocking card's near edge
                             if direction < 0:
-                                return oy + (ROWS - 1 - r) * sy + CARD_H
-                            return oy + (ROWS - 1 - r) * sy
+                                return oy + (ROWS - 1 - r) * sy + CARD_H + dy
+                            return oy + (ROWS - 1 - r) * sy + dy
                     return 0.0 if direction < 0 else ph           # paper edge
 
                 c.line(h_end(-1), cy, h_end(1), cy)
@@ -228,10 +230,12 @@ def build_pdf(entries, out_path, page_name, gap_mm, guides, backs=False, back_pa
 
         back_img = Image.open(back_path) if backs else None
         back_jpg = jpeg_of(back_img, "back") if backs else None
-        # with backs, the x-offset compensates duplex misalignment: it shifts the
+        # with backs, the offsets compensate duplex misalignment: they shift the
         # back pages relative to the front pages; without backs, everything shifts
         front_dx = 0.0 if backs else x_off
         back_dx = x_off if backs else 0.0
+        front_dy = 0.0 if backs else y_off
+        back_dy = y_off if backs else 0.0
         front_pages = (len(entries) + per_page - 1) // per_page
         for p_idx in range(front_pages):
             if p_idx:
@@ -240,18 +244,18 @@ def build_pdf(entries, out_path, page_name, gap_mm, guides, backs=False, back_pa
             for idx in range(p_idx * per_page, min((p_idx + 1) * per_page, len(entries))):
                 col, row = (idx % per_page) % COLS, (idx % per_page) // COLS
                 slots.append((col, row))
-                draw_card(jpeg_of(entries[idx][1], "card"), col, row, front_dx)
+                draw_card(jpeg_of(entries[idx][1], "card"), col, row, front_dx, front_dy)
             if guides:
-                draw_guides(slots, front_dx)
+                draw_guides(slots, front_dx, front_dy)
             if backs:
                 # duplex "flip on long edge" mirrors the sheet left-right, so the
                 # back of the front card at (col, row) goes to (COLS-1-col, row)
                 c.showPage()
                 back_slots = [(COLS - 1 - col, row) for col, row in slots]
                 for col, row in back_slots:
-                    draw_card(back_jpg, col, row, back_dx)
+                    draw_card(back_jpg, col, row, back_dx, back_dy)
                 if guides:
-                    draw_guides(back_slots, back_dx)
+                    draw_guides(back_slots, back_dx, back_dy)
         c.save()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -283,6 +287,9 @@ def main():
                         "pages relative to the fronts to compensate for imperfect "
                         "double-sided printing (positive = right); without --backs, "
                         "shifts all pages (default: 0.0)")
+    p.add_argument("--y-offset", type=float, default=0.0, metavar="MM",
+                   help="vertical offset in mm, same semantics as --x-offset "
+                        "(positive = up) (default: 0.0)")
     nb.add_detection_args(p)
     args = p.parse_args()
 
@@ -319,7 +326,8 @@ def main():
         raise SystemExit("error: no card could be resolved - nothing to print")
     front_pages, _ = build_pdf(entries, out, args.page, args.gap,
                                guides=not args.no_guides, backs=args.backs,
-                               back_path=back_path, x_offset_mm=args.x_offset)
+                               back_path=back_path, x_offset_mm=args.x_offset,
+                               y_offset_mm=args.y_offset)
     print(f"done: {len(entries)} card image(s) on {front_pages} {args.page} front page(s)"
           + (f" plus {front_pages} card-back page(s)" if args.backs else "")
           + f" ({COLS}x{ROWS} per page, each exactly 63x88 mm) -> {out}")
