@@ -15,8 +15,10 @@ oldest printing - the same resolution negate_border.py uses for a link) and
 negated with negate_border.py's pipeline, so every card in the PDF is the
 white-border version. Cards whose oldest printing is Alpha are taken from
 Unlimited instead (2ed already has a white border) and used as-is.
-Double-faced cards (transform / modal_dfc) are duplicated: every copy prints
-its front AND its back, so the pair can be sleeved together.
+Double-faced cards (transform / modal_dfc / double_faced_token) are duplicated:
+every copy prints its front AND its back, so the pair can be sleeved together.
+With --related, one copy of each card's related tokens / emblems (its Scryfall
+all_parts) is added to the PDF as well.
 
 Scale: a real Magic card is 63 x 88 mm. Every image is placed at exactly that
 size in PDF points (1 pt = 1/72 inch, so 63 mm = 178.5827 pt) via reportlab's
@@ -37,7 +39,7 @@ relative to the fronts to compensate for imperfect double-sided printing.
 
 Usage:
     deck_to_pdf.py DECKLIST [-o out.pdf] [--page a4|letter] [--gap MM] [--backs]
-                                 [--x-offset MM] [--y-offset MM]
+                                 [--x-offset MM] [--y-offset MM] [--related]
     deck_to_pdf.py -                        # read the deck list from stdin
 
 Requires pillow + numpy + reportlab (provided by the flake devShell:
@@ -96,11 +98,14 @@ def parse_decklist(text):
 def build_entries(deck, args):
     """Expand the deck list into [(label, image)] print entries: qty copies
     of each card, and for double-faced cards BOTH faces per copy (the card is
-    duplicated). Card resolution and negation live in negate_border.py
-    (card_by_name / process_card). Returns (entries, failed names)."""
+    duplicated). With args.related, one copy of each related token / emblem of
+    every card (its Scryfall all_parts) is added too. Card resolution and
+    negation live in negate_border.py (card_by_name / process_card).
+    Returns (entries, failed names)."""
     entries = []
     failures = []
     ns = SimpleNamespace(threshold=args.threshold, max_hole=args.max_hole)
+    related_seen = set()   # part uris already added, across the whole deck list
     for name, qty in deck:
         card = nb.card_by_name(name)
         if card is None:
@@ -120,6 +125,26 @@ def build_entries(deck, args):
                       f"{stats['frac']:.1f}% of card negated, mask: {stats.get('mask')}")
         for _ in range(qty):
             entries.extend((label, img) for label, img, _stats in imgs)
+        if not getattr(args, "related", False):
+            continue
+        for part in nb.related_parts(card):
+            pid = part.get("id") or part.get("uri")
+            if not pid or pid in related_seen:
+                continue
+            related_seen.add(pid)
+            try:
+                rel = nb.related_card(part)
+            except SystemExit as e:
+                print(f"  warning: related card '{part.get('name')}' of '{name}': {e}")
+                continue
+            print(f"  related: {rel.get('name')} ({rel.get('layout')}) "
+                  f"-> {rel.get('set')}/{rel.get('collector_number')}")
+            rimgs = nb.process_card(rel, ns)
+            for label, _img, stats in rimgs:
+                if stats is not None:
+                    print(f"  related face '{label}': border color {stats.get('border')}, "
+                          f"{stats['frac']:.1f}% of card negated, mask: {stats.get('mask')}")
+            entries.extend((f"{label} (related)", img) for label, img, _ in rimgs)
     return entries, failures
 
 
@@ -278,6 +303,9 @@ def main():
                    help="do not draw the corner cut marks on the cards")
     p.add_argument("--no-sideboard", action="store_true",
                    help="print only the main deck, skip the sideboard")
+    p.add_argument("--related", action="store_true",
+                   help="also add one copy of each card's related tokens / emblems "
+                        "(the card's Scryfall all_parts) to the PDF")
     p.add_argument("--backs", action="store_true",
                    help="insert a card-back page (back.png next to this script) after "
                         "each front page, mirrored left-right for double-sided printing "

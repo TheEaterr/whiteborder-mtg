@@ -52,7 +52,9 @@ leveler, spree, meld, leb); variant covers the legendary crown and, in the
 2015 frame, creature vs non-creature; extras are frame-effect buckets, the
 holostamp (`stamp`, `stamp_triangle`, ...) and `pw_back`. Each face of a
 two-faced card gets the key of its own characteristics; a back side never
-carries a stamp or DFC mark.
+carries a stamp or DFC mark. Tokens and emblems (`token` /
+`double_faced_token` / `emblem` layouts) use the default base of their frame
+era - their border ring is the standard one.
 
 When applying a mask, the card inside the border is inverted
 (`255 - pixel`). The innermost few mask lines are not fully negated: there the
@@ -77,7 +79,7 @@ and not cached under the plain key).
 Edge cases: cards whose oldest printing is Alpha (lea) are returned as the
 Unlimited (2ed) printing as-is (2ed already has a white border); Alpha/Beta
 and a few other off-scan sets (fbb/cei/ced/4bb) are never used; unsupported
-layouts (scheme, vanguard, token, emblem, ...) are left unchanged. A 429
+layouts (scheme, vanguard, ...) are left unchanged. A 429
 rate-limit response from Scryfall pauses for a few seconds before retrying.
 
 ## Setup
@@ -108,8 +110,11 @@ negate_border.py <url>                      # default output: <card>_negated.png
   border color for a pixel to count as border when detecting it on a card.
 - `--max-hole` (default 20000): largest enclosed pocket inside the border that
   still becomes part of the mask (covers the bottom-band text and holostamp).
-- Transform / modal_dfc cards produce one image per face
+- Transform / modal_dfc / double_faced_token cards produce one image per face
   (`<card>_face1_negated.png`, `<card>_face2_negated.png`, ...).
+- `--related` (card links only): also negate the related tokens / emblems of
+  the card (its Scryfall `all_parts`), saved next to the card's output as
+  `<part name>_negated.png`.
 
 ### deck_to_pdf.py
 
@@ -131,8 +136,11 @@ Sideboard
 
 - Each name is resolved on Scryfall (paper, black border, non-promo, oldest
   printing) and negated like `negate_border.py` does.
-- Double-faced cards (transform / modal_dfc) are duplicated: every copy prints
-  its front AND its back, so the pair can be sleeved together.
+- Double-faced cards (transform / modal_dfc / double_faced_token) are
+  duplicated: every copy prints its front AND its back, so the pair can be
+  sleeved together.
+- `--related` also adds one copy of each card's related tokens / emblems (the
+  card's Scryfall `all_parts`) to the PDF.
 - `--page a4|letter` (default a4), `--gap MM` (default 0.0), `--no-guides`,
   `--no-sideboard`, plus the shared `--threshold` / `--max-hole`.
 - `--backs` inserts a card-back page (`back.png` next to the script) after every

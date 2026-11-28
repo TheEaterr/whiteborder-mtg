@@ -44,16 +44,20 @@ Usage:
     negate_border.py IMAGE [-o OUT] [flags]
     negate_border.py DIR [-o OUTDIR] [flags]
 
-Detection flags: --threshold / --max-hole.
+Detection flags: --threshold / --max-hole. With --related on a card link, the
+related tokens / emblems of the card (its all_parts) are negated too, saved
+next to the card's output as <part name>_negated.png.
 
 Default outputs: <name>_negated.<ext> next to the input file, <dir>-negated/
 for a directory, <card>_negated.png for a URL (or <card>_faceN_negated.png per
-face for transform / modal_dfc cards - second faces are only processed for
-those layouts). Each face of a two-faced card gets the mask of its own
-characteristics; a back side never carries a holostamp or the DFC mark. Cards
-whose oldest printing is Alpha are returned as the Unlimited (2ed) printing
-as-is (2ed already has a white border). Unsupported layouts (scheme,
-vanguard, token, ...) are left unchanged.
+face for transform / modal_dfc / double_faced_token cards - second faces are
+only processed for those layouts). Each face of a two-faced card gets the
+mask of its own characteristics; a back side never carries a holostamp or
+the DFC mark. Tokens and emblems (layouts token / double_faced_token /
+emblem) are processed like normal cards of their frame era. Cards whose
+oldest printing is Alpha are returned as the Unlimited (2ed) printing as-is
+(2ed already has a white border). Unsupported layouts (scheme, vanguard,
+...) are left unchanged.
 
 Requires pillow + numpy (provided by the flake devShell:
 nix develop --command python3 negate_border.py IMAGE)
@@ -157,6 +161,27 @@ def unlimited_cache_file(oracle_id):
     return CARD_CACHE_DIR / f"unl_{key}.json"
 
 
+def related_cache_file(part_uri):
+    """Resolution cache file for a related part (token / emblem) of a card's
+    all_parts, keyed by the part's API uri."""
+    key = hashlib.sha1(f"rel|{part_uri}".encode()).hexdigest()[:16]
+    return CARD_CACHE_DIR / f"rel_{key}.json"
+
+
+def related_card(part):
+    """The related card (token / emblem) of an all_parts entry, resolved like
+    get_card() (oldest printing); cached in card_cache/ by part uri, so a
+    repeat run makes no Scryfall request for it."""
+    uri = part.get("uri") or ""
+    cf = related_cache_file(uri)
+    if cf.is_file():
+        return json.loads(cf.read_text())
+    card = get_card(uri)
+    CARD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cf.write_text(json.dumps(card))
+    return card
+
+
 def cached_mask_path(key):
     """Cached mask file for a key: the manually cleaned ref_masks_clean/
     folder is looked up first, then the generated ref_masks/ cache."""
@@ -258,15 +283,18 @@ LAYOUT_BASES = {"saga": "saga", "class": "saga", "case": "saga",
 # split cards are refined by subtype, from the keywords
 SPLIT_KEYWORDS = (("fuse", "fuse"), ("aftermath", "aftermath"))
 # layouts with the same border as a normal card of the same era; their
-# transform/meld marks come from the frame effects (dfc bucket)
+# transform/meld marks come from the frame effects (dfc bucket). Tokens and
+# emblems have the standard frame of their era (their border ring is a plain
+# one, no extra mark), so they share the default masks with normal cards
 LAYOUT_SAME_AS_NORMAL = {"flip", "adventure", "prepare", "mutate", "prototype",
-                         "host", "meld"}
-# layouts whose card physically has a second face with its own image
-MULTI_FACE_LAYOUTS = {"transform", "modal_dfc"}
+                         "host", "meld", "token", "emblem"}
+# layouts whose card physically has a second face with its own image.
+# double_faced_token fronts carry no DFC mark on the border, so - unlike
+# transform - no dfc bucket is assumed for them
+MULTI_FACE_LAYOUTS = {"transform", "modal_dfc", "double_faced_token"}
 # layouts without a usable card border - not supported
 LAYOUT_UNSUPPORTED = {"scheme", "vanguard", "augment", "art_series", "planar",
-                      "token", "emblem", "front_card", "reversible_card",
-                      "double_faced_token"}
+                      "front_card", "reversible_card"}
 
 # frame effects / traits that make a printing less plain than another
 SPECIAL_PRINTING_EFFECTS = {"showcase", "extendedart", "borderless", "etched",
@@ -1389,11 +1417,63 @@ def process_card(card, args):
             for face, out, stats in negate_card_faces(card, args)]
 
 
+def related_parts(card):
+    """The token / emblem parts of a card's all_parts. Emblems come through
+    as combo_piece with an 'Emblem' type line, like the card's own faces -
+    only the type line tells them apart."""
+    parts = []
+    for p in card.get("all_parts") or []:
+        comp = (p.get("component") or "").lower()
+        tl = (p.get("type_line") or "").lower()
+        if (comp == "token" or tl.startswith("emblem")) \
+                and p.get("uri") and p.get("uri") != card.get("uri"):
+            parts.append(p)
+    return parts
+
+
+def process_related(card, args, out_dir):
+    """Negate every related token / emblem of the card (--related), saved next
+    to the card's own output as <part name>_negated.png (_faceN for a
+    double-faced part)."""
+    seen = set()
+    used = set()
+    for part in related_parts(card):
+        pid = part.get("id") or part.get("uri")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            rel = related_card(part)
+        except SystemExit as e:
+            print(f"  warning: related card '{part.get('name')}': {e}")
+            continue
+        print(f"  related card: {rel.get('name')} ({rel.get('layout')})")
+        results = process_card(rel, args)
+        base = re.sub(r"[^A-Za-z0-9._-]+", "_", rel.get("name", "related")
+                      ).strip("_") or "related"
+        multi = len(results) > 1
+        for i, (label, out, stats) in enumerate(results):
+            stem = base if not multi else f"{base}_face{i + 1}"
+            dst = out_dir / f"{stem}_negated.png"
+            n = 2
+            while dst.name in used:      # two related parts with the same name
+                dst = out_dir / f"{stem}_{n}_negated.png"
+                n += 1
+            used.add(dst.name)
+            out.save(dst)
+            if stats is None:
+                print(f"  -> {dst}  (Unlimited printing, not processed: "
+                      f"{out.width}x{out.height})")
+            else:
+                report(f"  related face {i + 1} ({label})", dst, out, stats)
+
+
 def process_url(link, args):
     card = get_card(link)
     results = process_card(card, args)
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", card.get("name", "card")).strip("_") or "card"
     multi = len(results) > 1
+    out_dir = Path(args.output).parent if args.output else Path(".")
     for i, (label, out, stats) in enumerate(results):
         if args.output:
             p = Path(args.output)
@@ -1407,6 +1487,8 @@ def process_url(link, args):
                   f"{out.width}x{out.height})")
         else:
             report(f"  face {i + 1} ({label})", dst, out, stats)
+    if getattr(args, "related", False):
+        process_related(card, args, out_dir)
 
 
 def add_detection_args(p):
@@ -1432,11 +1514,17 @@ def main():
                    help="output file (file/URL input) or directory (dir input); "
                         "default: <name>_negated.<ext> / <dir>-negated/ / <card>_negated.png")
     add_detection_args(p)
+    p.add_argument("--related", action="store_true",
+                   help="with a Scryfall card link, also negate the related cards "
+                        "(the tokens / emblems of the card's all_parts), saved next "
+                        "to the card's output")
     args = p.parse_args()
 
     if args.input.startswith(("http://", "https://")):
         process_url(args.input, args)
     else:
+        if args.related:
+            print("warning: --related only applies to Scryfall card links - ignored")
         src = Path(args.input)
         if src.is_dir():
             process_dir(src, args)
